@@ -625,7 +625,10 @@ class MainWindow(wx.Frame):
     def _setup_ui(self) -> None:
         """Set up the main UI layout."""
         panel = wx.Panel(self)
-        main_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Main content area (horizontal)
+        content_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
         # Left document panel
         self.left_panel = DocumentPanel(panel, "left")
@@ -639,9 +642,37 @@ class MainWindow(wx.Frame):
         self.right_panel = DocumentPanel(panel, "right")
         self.right_panel.SetMinSize((200, -1))
 
-        main_sizer.Add(self.left_panel, 1, wx.EXPAND | wx.ALL, 5)
-        main_sizer.Add(self.link_overlay, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 5)
-        main_sizer.Add(self.right_panel, 1, wx.EXPAND | wx.ALL, 5)
+        content_sizer.Add(self.left_panel, 1, wx.EXPAND | wx.ALL, 5)
+        content_sizer.Add(self.link_overlay, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 5)
+        content_sizer.Add(self.right_panel, 1, wx.EXPAND | wx.ALL, 5)
+
+        main_sizer.Add(content_sizer, 1, wx.EXPAND)
+
+        # Bottom sync scroll bar area
+        sync_panel = wx.Panel(panel)
+        sync_panel.SetBackgroundColour(wx.Colour(240, 240, 240))
+        sync_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        sync_label = wx.StaticText(sync_panel, label="連動スクロール:")
+        sync_label.SetForegroundColour(wx.Colour(80, 80, 80))
+        sync_sizer.Add(sync_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 10)
+
+        self.sync_scrollbar = wx.Slider(
+            sync_panel,
+            value=0,
+            minValue=0,
+            maxValue=100,
+            style=wx.SL_HORIZONTAL
+        )
+        sync_sizer.Add(self.sync_scrollbar, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Sync toggle checkbox
+        self.sync_checkbox = wx.CheckBox(sync_panel, label="連動")
+        self.sync_checkbox.SetValue(False)
+        sync_sizer.Add(self.sync_checkbox, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+
+        sync_panel.SetSizer(sync_sizer)
+        main_sizer.Add(sync_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         panel.SetSizer(main_sizer)
 
@@ -652,6 +683,10 @@ class MainWindow(wx.Frame):
         self.left_panel.Bind(wx.EVT_SCROLLWIN, self._on_panel_scroll)
         self.right_panel.Bind(wx.EVT_SCROLLWIN, self._on_panel_scroll)
         self.Bind(wx.EVT_SIZE, self._on_window_resize)
+
+        # Bind sync scrollbar
+        self.sync_scrollbar.Bind(wx.EVT_SLIDER, self._on_sync_scroll)
+        self.sync_checkbox.Bind(wx.EVT_CHECKBOX, self._on_sync_toggle)
 
     def _setup_menu(self) -> None:
         """Set up the menu bar."""
@@ -997,12 +1032,74 @@ class MainWindow(wx.Frame):
     def _on_panel_scroll(self, event: wx.ScrollWinEvent) -> None:
         """Handle scroll event from document panels."""
         event.Skip()
+
+        # Sync scroll if enabled
+        if hasattr(self, 'sync_checkbox') and self.sync_checkbox.GetValue():
+            source_panel = event.GetEventObject()
+            if source_panel == self.left_panel:
+                self._sync_scroll_from(self.left_panel, self.right_panel)
+            elif source_panel == self.right_panel:
+                self._sync_scroll_from(self.right_panel, self.left_panel)
+
         wx.CallAfter(self._update_links)
+        wx.CallAfter(self._update_sync_scrollbar)
 
     def _on_window_resize(self, event: wx.SizeEvent) -> None:
         """Handle window resize event."""
         event.Skip()
         wx.CallAfter(self._update_links)
+
+    def _on_sync_scroll(self, event: wx.CommandEvent) -> None:
+        """Handle sync scrollbar movement."""
+        if not self.left_doc or not self.right_doc:
+            return
+
+        value = self.sync_scrollbar.GetValue()
+        percent = value / 100.0
+
+        # Scroll both panels to the same percentage
+        self._scroll_panel_to_percent(self.left_panel, percent)
+        self._scroll_panel_to_percent(self.right_panel, percent)
+
+        wx.CallAfter(self._update_links)
+
+    def _on_sync_toggle(self, event: wx.CommandEvent) -> None:
+        """Handle sync checkbox toggle."""
+        if self.sync_checkbox.GetValue():
+            # Sync both panels when enabled
+            wx.CallAfter(self._update_sync_scrollbar)
+
+    def _sync_scroll_from(self, source: DocumentPanel, target: DocumentPanel) -> None:
+        """Sync scroll position from source to target panel."""
+        # Get source scroll position as percentage
+        source_range = source.GetScrollRange(wx.VERTICAL)
+        source_pos = source.GetScrollPos(wx.VERTICAL)
+
+        if source_range > 0:
+            percent = source_pos / source_range
+            target_range = target.GetScrollRange(wx.VERTICAL)
+            target_pos = int(percent * target_range)
+            target.Scroll(-1, target_pos)
+
+    def _scroll_panel_to_percent(self, panel: DocumentPanel, percent: float) -> None:
+        """Scroll panel to a percentage position."""
+        scroll_range = panel.GetScrollRange(wx.VERTICAL)
+        if scroll_range > 0:
+            pos = int(percent * scroll_range)
+            panel.Scroll(-1, pos)
+
+    def _update_sync_scrollbar(self) -> None:
+        """Update sync scrollbar position based on panel scroll."""
+        if not hasattr(self, 'sync_scrollbar'):
+            return
+
+        # Use left panel position as reference
+        scroll_range = self.left_panel.GetScrollRange(wx.VERTICAL)
+        scroll_pos = self.left_panel.GetScrollPos(wx.VERTICAL)
+
+        if scroll_range > 0:
+            percent = int((scroll_pos / scroll_range) * 100)
+            self.sync_scrollbar.SetValue(min(100, max(0, percent)))
 
     def _update_links(self) -> None:
         """Update the link lines between matched pages."""

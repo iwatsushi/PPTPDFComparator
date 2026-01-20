@@ -53,9 +53,6 @@ temp/
 *.tmp
 
 # Test/Debug files
-*.pdf
-*.pptx
-*.ppt
 debug_output.txt
 *_highlight*.png
 test_*.png
