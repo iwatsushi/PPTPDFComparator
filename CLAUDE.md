@@ -57,6 +57,27 @@ python -m src.main --gui wx
 pytest tests/
 ```
 
+## Build EXE (Windows)
+```bash
+# Install PyInstaller
+pip install pyinstaller
+
+# Build standalone EXE
+pyinstaller --onefile --windowed --name PPTPDFComparator \
+  --paths src \
+  --hidden-import wx --hidden-import cv2 --hidden-import numpy \
+  --hidden-import scipy.optimize --hidden-import imagehash \
+  --hidden-import fitz --hidden-import pptx --hidden-import comtypes.client \
+  --hidden-import core --hidden-import utils --hidden-import gui_wx \
+  --exclude-module PySide6 --exclude-module PyQt5 --exclude-module PyQt6 \
+  --exclude-module torch --exclude-module pandas --exclude-module matplotlib \
+  src/main.py
+
+# Output: dist/PPTPDFComparator.exe
+```
+
+**Note:** PowerPoint files require Microsoft PowerPoint installed on the target machine.
+
 ## System Dependencies
 - **Poppler**: Required for PDF rendering
   - Windows: Download from https://github.com/oschwartz10612/poppler-windows/releases
