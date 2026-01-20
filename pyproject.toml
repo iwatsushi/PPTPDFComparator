@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pptpdf-comparator"
+version = "0.1.0"
+description = "GUI application for comparing PowerPoint and PDF documents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "iwatsushi"}
+]
+dependencies = [
+    "PySide6>=6.6.0",
+    "wxPython>=4.2.0",
+    "pymupdf>=1.23.0",
+    "python-pptx>=0.6.21",
+    "Pillow>=10.0.0",
+    "opencv-python>=4.8.0",
+    "imagehash>=4.3.0",
+    "scipy>=1.11.0",
+    "numpy>=1.24.0",
+    "reportlab>=4.0.0",
+    "jinja2>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+pptpdf-comparator = "src.main:main"
+pptpdf-pyside = "src.main_pyside:main"
+pptpdf-wx = "src.main_wx:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
