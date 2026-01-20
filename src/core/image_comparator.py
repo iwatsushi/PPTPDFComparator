@@ -51,8 +51,8 @@ class DiffResult:
     @property
     def has_differences(self) -> bool:
         """Check if there are any meaningful differences."""
-        # diff_score > 0.5% and at least one region detected
-        return self.diff_score > 0.005 and len(self.regions) > 0
+        # Either diff_score > 1% OR at least one region detected
+        return self.diff_score > 0.01 or len(self.regions) > 0
 
     @property
     def diff_count(self) -> int:

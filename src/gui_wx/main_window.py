@@ -594,7 +594,7 @@ class LinkOverlayPanel(wx.Panel):
             else:
                 color = wx.Colour(108, 117, 125)  # Gray
 
-            pen = gc.CreatePen(wx.GraphicsPenInfo(color).Width(4))
+            pen = gc.CreatePen(wx.GraphicsPenInfo(color).Width(8))
             gc.SetPen(pen)
             gc.StrokeLine(left_x, left_local.y, right_x, right_local.y)
 

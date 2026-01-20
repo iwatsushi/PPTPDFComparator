@@ -875,7 +875,7 @@ class LinkOverlay(QWidget):
                 color = QColor(108, 117, 125)  # Gray - unmatched
 
             pen = QPen(color)
-            pen.setWidth(4)  # Increased line width
+            pen.setWidth(8)  # Thick line for visibility
             painter.setPen(pen)
 
             # Draw line
