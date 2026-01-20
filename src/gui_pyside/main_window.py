@@ -9,7 +9,8 @@ import sys
 from PySide6.QtCore import Qt, Signal, QMimeData, QPoint, QRectF, QTimer
 from PySide6.QtGui import (
     QAction, QPainter, QPen, QColor, QBrush,
-    QDragEnterEvent, QDropEvent, QPixmap, QFont
+    QDragEnterEvent, QDropEvent, QPixmap, QFont,
+    QShortcut, QKeySequence
 )
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,21 +18,25 @@ from PySide6.QtWidgets import (
     QToolBar, QStatusBar, QFileDialog, QMessageBox,
     QProgressDialog, QApplication, QFrame, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QGraphicsLineItem,
-    QGraphicsRectItem, QSlider, QCheckBox
+    QGraphicsRectItem, QSlider, QCheckBox, QDialog,
+    QDialogButtonBox, QListWidget, QListWidgetItem,
+    QPushButton, QSpinBox, QLineEdit, QComboBox,
+    QFormLayout, QGroupBox, QColorDialog, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 
 try:
     from src.core.document import Document
     from src.core.page_matcher import PageMatcher, MatchingResult, MatchStatus
     from src.core.image_comparator import ImageComparator, DiffResult
-    from src.core.exclusion_zone import ExclusionZoneSet
+    from src.core.exclusion_zone import ExclusionZone, ExclusionZoneSet, AppliesTo
     from src.core.session import Session
     from src.utils.image_utils import pil_to_qpixmap
 except ImportError:
     from core.document import Document
     from core.page_matcher import PageMatcher, MatchingResult, MatchStatus
     from core.image_comparator import ImageComparator, DiffResult
-    from core.exclusion_zone import ExclusionZoneSet
+    from core.exclusion_zone import ExclusionZone, ExclusionZoneSet, AppliesTo
     from core.session import Session
     from utils.image_utils import pil_to_qpixmap
 
@@ -41,6 +46,7 @@ class PageThumbnail(QFrame):
 
     clicked = Signal(int, str)  # page_index, side ("left" or "right")
     double_clicked = Signal(int, str)
+    exclusion_zone_drawn = Signal(str, int, float, float, float, float)  # side, page_idx, x, y, w, h
 
     def __init__(
         self,
@@ -58,6 +64,12 @@ class PageThumbnail(QFrame):
         self._match_status: Optional[MatchStatus] = None
         self._diff_result: Optional[DiffResult] = None
 
+        # Exclusion zone drawing state
+        self._drawing_mode: bool = False
+        self._draw_start: Optional[QPoint] = None
+        self._draw_current: Optional[QPoint] = None
+        self._exclusion_zones: List[tuple] = []  # List of (x, y, w, h) in normalized coords
+
         self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
         self.setLineWidth(2)
 
@@ -70,6 +82,7 @@ class PageThumbnail(QFrame):
             self.image_label.sizePolicy().horizontalPolicy(),
             self.image_label.sizePolicy().verticalPolicy()
         )
+        self.image_label.setMouseTracking(True)
 
         self.page_label = QLabel(f"Page {page_index + 1}")
         self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -82,6 +95,22 @@ class PageThumbnail(QFrame):
 
         self.setAcceptDrops(True)
         self._update_style()
+
+    def set_drawing_mode(self, enabled: bool) -> None:
+        """Enable or disable exclusion zone drawing mode."""
+        self._drawing_mode = enabled
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._draw_start = None
+        self._draw_current = None
+        self.update()
+
+    def set_exclusion_zones(self, zones: List[tuple]) -> None:
+        """Set exclusion zones to display as overlays."""
+        self._exclusion_zones = zones
+        self.update()
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         """Set the thumbnail image."""
@@ -173,14 +202,102 @@ class PageThumbnail(QFrame):
     def mousePressEvent(self, event):
         """Handle mouse press."""
         if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.page_index, self.side)
+            if self._drawing_mode:
+                # Start drawing exclusion zone
+                self._draw_start = event.position().toPoint()
+                self._draw_current = self._draw_start
+            else:
+                self.clicked.emit(self.page_index, self.side)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Handle mouse move."""
+        if self._drawing_mode and self._draw_start is not None:
+            self._draw_current = event.position().toPoint()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._drawing_mode and self._draw_start is not None and self._draw_current is not None:
+                # Calculate normalized coordinates relative to image
+                pixmap = self.image_label.pixmap()
+                if pixmap:
+                    img_rect = self.image_label.geometry()
+                    img_w = pixmap.width()
+                    img_h = pixmap.height()
+
+                    # Get image offset within label (centered)
+                    offset_x = (img_rect.width() - img_w) // 2
+                    offset_y = (img_rect.height() - img_h) // 2
+
+                    # Adjust coordinates relative to image
+                    x1 = self._draw_start.x() - img_rect.x() - offset_x
+                    y1 = self._draw_start.y() - img_rect.y() - offset_y
+                    x2 = self._draw_current.x() - img_rect.x() - offset_x
+                    y2 = self._draw_current.y() - img_rect.y() - offset_y
+
+                    # Normalize to 0-1 range
+                    if img_w > 0 and img_h > 0:
+                        nx = max(0, min(x1, x2)) / img_w
+                        ny = max(0, min(y1, y2)) / img_h
+                        nw = abs(x2 - x1) / img_w
+                        nh = abs(y2 - y1) / img_h
+
+                        # Only emit if zone is large enough
+                        if nw > 0.01 and nh > 0.01:
+                            self.exclusion_zone_drawn.emit(self.side, self.page_index, nx, ny, nw, nh)
+
+                self._draw_start = None
+                self._draw_current = None
+                self.update()
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         """Handle double click."""
         if event.button() == Qt.MouseButton.LeftButton:
             self.double_clicked.emit(self.page_index, self.side)
         super().mouseDoubleClickEvent(event)
+
+    def paintEvent(self, event):
+        """Paint the widget with exclusion zone overlays."""
+        super().paintEvent(event)
+
+        pixmap = self.image_label.pixmap()
+        if not pixmap:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        img_rect = self.image_label.geometry()
+        img_w = pixmap.width()
+        img_h = pixmap.height()
+
+        # Get image offset within label (centered)
+        offset_x = img_rect.x() + (img_rect.width() - img_w) // 2
+        offset_y = img_rect.y() + (img_rect.height() - img_h) // 2
+
+        # Draw existing exclusion zones
+        painter.setBrush(QBrush(QColor(255, 0, 0, 50)))
+        painter.setPen(QPen(QColor(255, 0, 0), 2, Qt.PenStyle.DotLine))
+        for x, y, w, h in self._exclusion_zones:
+            rect_x = offset_x + int(x * img_w)
+            rect_y = offset_y + int(y * img_h)
+            rect_w = int(w * img_w)
+            rect_h = int(h * img_h)
+            painter.drawRect(rect_x, rect_y, rect_w, rect_h)
+
+        # Draw current selection rectangle
+        if self._drawing_mode and self._draw_start and self._draw_current:
+            painter.setBrush(QBrush(QColor(0, 120, 215, 50)))
+            painter.setPen(QPen(QColor(0, 120, 215), 2))
+            x1, y1 = self._draw_start.x(), self._draw_start.y()
+            x2, y2 = self._draw_current.x(), self._draw_current.y()
+            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+
+        painter.end()
 
     def get_center_global(self) -> QPoint:
         """Get center position in global coordinates."""
@@ -194,6 +311,7 @@ class DocumentPanel(QScrollArea):
     page_clicked = Signal(int, str)
     page_double_clicked = Signal(int, str)
     file_dropped = Signal(str)
+    exclusion_zone_drawn = Signal(str, int, float, float, float, float)  # side, page_idx, x, y, w, h
 
     def __init__(self, side: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -321,6 +439,7 @@ class DocumentPanel(QScrollArea):
             thumb = PageThumbnail(page.index, self.side)
             thumb.clicked.connect(self._on_page_clicked)
             thumb.double_clicked.connect(self._on_page_double_clicked)
+            thumb.exclusion_zone_drawn.connect(self._on_exclusion_zone_drawn)
 
             if page.thumbnail:
                 pixmap = pil_to_qpixmap(page.thumbnail)
@@ -328,6 +447,10 @@ class DocumentPanel(QScrollArea):
 
             self.thumbnails.append(thumb)
             self.layout.insertWidget(self.layout.count() - 1, thumb)
+
+    def _on_exclusion_zone_drawn(self, side: str, page_index: int, x: float, y: float, w: float, h: float) -> None:
+        """Forward exclusion zone signal to parent."""
+        self.exclusion_zone_drawn.emit(side, page_index, x, y, w, h)
 
     def _on_page_clicked(self, index: int, side: str):
         """Handle page click."""
@@ -389,6 +512,25 @@ class DocumentPanel(QScrollArea):
         # Ensure the widget is scrolled into view, centered if possible
         self.ensureWidgetVisible(thumb, 0, self.height() // 4)
 
+    def set_drawing_mode(self, enabled: bool) -> None:
+        """Enable or disable exclusion zone drawing mode on all thumbnails."""
+        for thumb in self.thumbnails:
+            thumb.set_drawing_mode(enabled)
+
+    def update_exclusion_zones(self, zones: List[ExclusionZone]) -> None:
+        """Update exclusion zone overlays on all thumbnails."""
+        for thumb in self.thumbnails:
+            applicable_zones = []
+            for z in zones:
+                if z.enabled:
+                    if z.applies_to == AppliesTo.BOTH:
+                        applicable_zones.append((z.x, z.y, z.width, z.height))
+                    elif z.applies_to == AppliesTo.LEFT and self.side == "left":
+                        applicable_zones.append((z.x, z.y, z.width, z.height))
+                    elif z.applies_to == AppliesTo.RIGHT and self.side == "right":
+                        applicable_zones.append((z.x, z.y, z.width, z.height))
+            thumb.set_exclusion_zones(applicable_zones)
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         """Handle drag enter."""
         if event.mimeData().hasUrls():
@@ -421,6 +563,280 @@ class DocumentPanel(QScrollArea):
             self.file_dropped.emit(valid_files[0])
 
         event.acceptProposedAction()
+
+
+class ExclusionZoneDialog(QDialog):
+    """Dialog for managing exclusion zones."""
+
+    def __init__(self, parent: QWidget, zone_set: ExclusionZoneSet):
+        super().__init__(parent)
+        self.zone_set = zone_set
+        self.setWindowTitle("除外領域")
+        self.setMinimumSize(500, 400)
+        self._setup_ui()
+        self._populate_list()
+
+    def _setup_ui(self) -> None:
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+
+        # Zone list
+        layout.addWidget(QLabel("除外領域一覧:"))
+        self.zone_list = QListWidget()
+        self.zone_list.itemChanged.connect(self._on_item_changed)
+        layout.addWidget(self.zone_list)
+
+        # Preset buttons
+        preset_group = QGroupBox("プリセット追加")
+        preset_layout = QHBoxLayout(preset_group)
+
+        presets = [
+            ("ページ番号(下)", ExclusionZoneSet.preset_page_number_bottom),
+            ("ページ番号(右下)", ExclusionZoneSet.preset_page_number_bottom_right),
+            ("ヘッダー", ExclusionZoneSet.preset_header),
+            ("フッター", ExclusionZoneSet.preset_footer),
+            ("スライド番号", ExclusionZoneSet.preset_slide_number_ppt),
+        ]
+
+        for name, factory in presets:
+            btn = QPushButton(name)
+            btn.clicked.connect(lambda checked, f=factory: self._add_preset(f))
+            preset_layout.addWidget(btn)
+
+        layout.addWidget(preset_group)
+
+        # Manual input
+        manual_group = QGroupBox("カスタム領域追加")
+        manual_layout = QFormLayout(manual_group)
+
+        coord_layout = QHBoxLayout()
+        self.x_input = QSpinBox()
+        self.x_input.setRange(0, 100)
+        coord_layout.addWidget(QLabel("X:"))
+        coord_layout.addWidget(self.x_input)
+
+        self.y_input = QSpinBox()
+        self.y_input.setRange(0, 100)
+        coord_layout.addWidget(QLabel("Y:"))
+        coord_layout.addWidget(self.y_input)
+
+        self.w_input = QSpinBox()
+        self.w_input.setRange(1, 100)
+        self.w_input.setValue(20)
+        coord_layout.addWidget(QLabel("幅:"))
+        coord_layout.addWidget(self.w_input)
+
+        self.h_input = QSpinBox()
+        self.h_input.setRange(1, 100)
+        self.h_input.setValue(10)
+        coord_layout.addWidget(QLabel("高さ:"))
+        coord_layout.addWidget(self.h_input)
+
+        manual_layout.addRow("座標 (%):", coord_layout)
+
+        name_layout = QHBoxLayout()
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("領域名")
+        name_layout.addWidget(self.name_input)
+
+        self.applies_combo = QComboBox()
+        self.applies_combo.addItems(["両方", "左のみ", "右のみ"])
+        name_layout.addWidget(self.applies_combo)
+
+        add_btn = QPushButton("追加")
+        add_btn.clicked.connect(self._add_custom_zone)
+        name_layout.addWidget(add_btn)
+
+        manual_layout.addRow("名前/適用:", name_layout)
+        layout.addWidget(manual_group)
+
+        # Remove button
+        remove_btn = QPushButton("選択した領域を削除")
+        remove_btn.clicked.connect(self._remove_zone)
+        layout.addWidget(remove_btn)
+
+        # Dialog buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _populate_list(self) -> None:
+        """Populate the list with current zones."""
+        self.zone_list.clear()
+        for zone in self.zone_set.zones:
+            label = f"{zone.name or '名前なし'} ({zone.x:.0%}, {zone.y:.0%}, {zone.width:.0%}x{zone.height:.0%})"
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if zone.enabled else Qt.CheckState.Unchecked)
+            self.zone_list.addItem(item)
+
+    def _add_preset(self, factory) -> None:
+        """Add a preset zone."""
+        zone = factory()
+        self.zone_set.add(zone)
+        self._populate_list()
+
+    def _add_custom_zone(self) -> None:
+        """Add a custom zone from inputs."""
+        x = self.x_input.value() / 100.0
+        y = self.y_input.value() / 100.0
+        w = self.w_input.value() / 100.0
+        h = self.h_input.value() / 100.0
+        name = self.name_input.text() or "カスタム"
+
+        applies_map = {0: AppliesTo.BOTH, 1: AppliesTo.LEFT, 2: AppliesTo.RIGHT}
+        applies_to = applies_map[self.applies_combo.currentIndex()]
+
+        zone = ExclusionZone(x=x, y=y, width=w, height=h, name=name, applies_to=applies_to)
+        self.zone_set.add(zone)
+        self._populate_list()
+
+    def _remove_zone(self) -> None:
+        """Remove the selected zone."""
+        row = self.zone_list.currentRow()
+        if row >= 0 and row < len(self.zone_set.zones):
+            zone = self.zone_set.zones[row]
+            self.zone_set.remove(zone)
+            self._populate_list()
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        """Handle checkbox toggle."""
+        row = self.zone_list.row(item)
+        if row >= 0 and row < len(self.zone_set.zones):
+            self.zone_set.zones[row].enabled = item.checkState() == Qt.CheckState.Checked
+
+
+class DiffSummaryDialog(QWidget):
+    """Modeless dialog showing pages with differences."""
+
+    jump_requested = Signal(int, int)  # left_idx, right_idx
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("差分一覧")
+        self.setMinimumSize(400, 500)
+        self.diff_pages: List[tuple] = []
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+
+        # Header
+        header = QLabel("差分があるページ一覧")
+        font = header.font()
+        font.setPointSize(12)
+        font.setBold(True)
+        header.setFont(font)
+        layout.addWidget(header)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["左ページ", "右ページ", "状態"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.cellDoubleClicked.connect(self._on_double_click)
+        layout.addWidget(self.table)
+
+        # Summary
+        self.summary_label = QLabel("")
+        layout.addWidget(self.summary_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        jump_btn = QPushButton("ジャンプ")
+        jump_btn.clicked.connect(self._on_jump)
+        btn_layout.addWidget(jump_btn)
+
+        export_btn = QPushButton("CSVエクスポート")
+        export_btn.clicked.connect(self._on_export)
+        btn_layout.addWidget(export_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+    def update_diff_list(self, matching_result: Optional[MatchingResult], diff_scores: dict) -> None:
+        """Update the list with current diff information."""
+        self.table.setRowCount(0)
+        self.diff_pages = []
+
+        if not matching_result:
+            self.summary_label.setText("比較結果がありません")
+            return
+
+        diff_count = 0
+        identical_count = 0
+        unmatched_count = 0
+
+        for match in matching_result.matches:
+            if match.status == MatchStatus.MATCHED:
+                has_diff = diff_scores.get((match.left_index, match.right_index), False)
+                if has_diff:
+                    diff_count += 1
+                    status = "差分あり"
+                    color = QColor(255, 200, 200)
+                else:
+                    identical_count += 1
+                    status = "同一"
+                    color = QColor(200, 255, 200)
+
+                self.diff_pages.append((match.left_index, match.right_index, has_diff))
+
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                self.table.setItem(row, 0, QTableWidgetItem(str(match.left_index + 1)))
+                self.table.setItem(row, 1, QTableWidgetItem(str(match.right_index + 1)))
+                self.table.setItem(row, 2, QTableWidgetItem(status))
+
+                for col in range(3):
+                    self.table.item(row, col).setBackground(color)
+            else:
+                unmatched_count += 1
+
+        self.summary_label.setText(
+            f"差分あり: {diff_count}  同一: {identical_count}  未マッチ: {unmatched_count}"
+        )
+
+    def _on_double_click(self, row: int, col: int) -> None:
+        """Handle double click on row."""
+        self._jump_to_row(row)
+
+    def _on_jump(self) -> None:
+        """Jump to selected row."""
+        row = self.table.currentRow()
+        if row >= 0:
+            self._jump_to_row(row)
+
+    def _jump_to_row(self, row: int) -> None:
+        """Jump to the specified row."""
+        if row >= 0 and row < len(self.diff_pages):
+            left_idx, right_idx, _ = self.diff_pages[row]
+            self.jump_requested.emit(left_idx, right_idx)
+
+    def _on_export(self) -> None:
+        """Export diff list to CSV."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "CSVエクスポート", "", "CSV Files (*.csv)"
+        )
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write("Left Page,Right Page,Status\n")
+                    for left_idx, right_idx, has_diff in self.diff_pages:
+                        status = "差分あり" if has_diff else "同一"
+                        f.write(f"{left_idx + 1},{right_idx + 1},{status}\n")
+                QMessageBox.information(self, "完了", f"エクスポート完了: {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "エラー", f"エクスポート失敗: {e}")
+
+    def get_diff_page_indices(self) -> List[tuple]:
+        """Get list of (left_idx, right_idx) for pages with differences."""
+        return [(left, right) for left, right, has_diff in self.diff_pages if has_diff]
 
 
 class LinkOverlay(QWidget):
@@ -459,10 +875,10 @@ class LinkOverlay(QWidget):
                 color = QColor(108, 117, 125)  # Gray - unmatched
 
             pen = QPen(color)
-            pen.setWidth(2)
+            pen.setWidth(4)  # Increased line width
             painter.setPen(pen)
 
-            # Draw bezier curve
+            # Draw line
             painter.drawLine(left_pos, right_pos)
 
         painter.end()
@@ -482,10 +898,16 @@ class MainWindow(QMainWindow):
         self.right_doc: Optional[Document] = None
         self.matching_result: Optional[MatchingResult] = None
         self.exclusion_zones = ExclusionZoneSet()
-        self.diff_scores: dict = {}  # (left_idx, right_idx) -> diff_score
+        self.diff_scores: dict = {}  # (left_idx, right_idx) -> has_differences
 
         self._selected_left: Optional[int] = None
         self._selected_right: Optional[int] = None
+        self._current_diff_index: int = -1  # Current position in diff navigation
+        self._highlight_color: tuple = (255, 0, 0)  # RGB for highlight
+        self._drawing_mode: bool = False  # Exclusion zone drawing mode
+
+        # Modeless dialogs
+        self._diff_summary_dialog: Optional[DiffSummaryDialog] = None
 
         self._setup_ui()
         self._setup_menu()
@@ -529,6 +951,10 @@ class MainWindow(QMainWindow):
         self.right_panel.page_double_clicked.connect(self._on_page_double_clicked)
         self.right_panel.file_dropped.connect(self._on_right_file_dropped)
         self.right_panel.setMinimumWidth(200)
+
+        # Connect exclusion zone signals
+        self.left_panel.exclusion_zone_drawn.connect(self._on_exclusion_zone_drawn)
+        self.right_panel.exclusion_zone_drawn.connect(self._on_exclusion_zone_drawn)
 
         self.splitter.addWidget(self.left_panel)
         self.splitter.addWidget(self.right_panel)
@@ -588,10 +1014,26 @@ class MainWindow(QMainWindow):
         self._update_sync_scrollbar()
 
     def _on_sync_scroll(self, value: int) -> None:
-        """Handle sync scrollbar movement."""
+        """Handle sync scrollbar movement - scroll through matched pairs."""
         if not self.left_doc or not self.right_doc:
             return
 
+        # If we have matching results, scroll through matched pairs
+        if self.matching_result:
+            matched_pairs = self.matching_result.get_matched_pairs()
+            if matched_pairs:
+                # Map slider value to pair index
+                pair_idx = int(value / 100.0 * len(matched_pairs))
+                pair_idx = min(pair_idx, len(matched_pairs) - 1)
+
+                left_idx, right_idx, _ = matched_pairs[pair_idx]
+                self.left_panel.scroll_to_page(left_idx)
+                self.right_panel.scroll_to_page(right_idx)
+
+                self._update_links()
+                return
+
+        # Fallback: scroll both panels to the same percentage
         percent = value / 100.0
         self._scroll_panel_to_percent(self.left_panel, percent)
         self._scroll_panel_to_percent(self.right_panel, percent)
@@ -603,15 +1045,59 @@ class MainWindow(QMainWindow):
             self._update_sync_scrollbar()
 
     def _sync_scroll_from(self, source: DocumentPanel, target: DocumentPanel) -> None:
-        """Sync scroll position from source to target panel."""
-        source_bar = source.verticalScrollBar()
-        target_bar = target.verticalScrollBar()
+        """Sync scroll position from source to target panel, trying to align paired slides."""
+        if not self.matching_result:
+            # Fallback to percentage-based sync if no matching
+            source_bar = source.verticalScrollBar()
+            target_bar = target.verticalScrollBar()
+            source_range = source_bar.maximum()
+            if source_range > 0:
+                percent = source_bar.value() / source_range
+                target_pos = int(percent * target_bar.maximum())
+                target_bar.setValue(target_pos)
+            return
 
-        source_range = source_bar.maximum()
-        if source_range > 0:
-            percent = source_bar.value() / source_range
-            target_pos = int(percent * target_bar.maximum())
-            target_bar.setValue(target_pos)
+        # Find the most visible slide in source panel
+        source_visible_idx = self._get_center_visible_page(source)
+        if source_visible_idx is None:
+            return
+
+        # Find paired slide
+        if source == self.left_panel:
+            match = self.matching_result.get_match_for_left(source_visible_idx)
+            if match and match.right_index is not None:
+                target.scroll_to_page(match.right_index)
+        else:
+            match = self.matching_result.get_match_for_right(source_visible_idx)
+            if match and match.left_index is not None:
+                target.scroll_to_page(match.left_index)
+
+    def _get_center_visible_page(self, panel: DocumentPanel) -> Optional[int]:
+        """Get the page index that's most visible (closest to center) in the panel."""
+        if not panel.thumbnails:
+            return None
+
+        viewport = panel.viewport()
+        if not viewport:
+            return None
+        panel_height = viewport.height()
+        panel_center_y = panel_height // 2
+
+        # Find which thumbnail is closest to the center
+        best_idx = 0
+        best_distance = float('inf')
+
+        for i, thumb in enumerate(panel.thumbnails):
+            # Get thumbnail position relative to viewport
+            thumb_pos = thumb.mapTo(viewport, QPoint(0, 0))
+            thumb_center_y = thumb_pos.y() + thumb.height() // 2
+
+            distance = abs(thumb_center_y - panel_center_y)
+            if distance < best_distance:
+                best_distance = distance
+                best_idx = i
+
+        return best_idx
 
     def _scroll_panel_to_percent(self, panel: DocumentPanel, percent: float) -> None:
         """Scroll panel to a percentage position."""
@@ -620,7 +1106,23 @@ class MainWindow(QMainWindow):
         scrollbar.setValue(pos)
 
     def _update_sync_scrollbar(self) -> None:
-        """Update sync scrollbar position based on panel scroll."""
+        """Update sync scrollbar position based on currently visible pair."""
+        # If we have matching results, position based on current pair
+        if self.matching_result:
+            matched_pairs = self.matching_result.get_matched_pairs()
+            if matched_pairs:
+                visible_idx = self._get_center_visible_page(self.left_panel)
+                if visible_idx is not None:
+                    # Find which pair contains this index
+                    for i, (left_idx, right_idx, _) in enumerate(matched_pairs):
+                        if left_idx == visible_idx:
+                            percent = int((i / len(matched_pairs)) * 100)
+                            self.sync_scrollbar.blockSignals(True)
+                            self.sync_scrollbar.setValue(min(100, max(0, percent)))
+                            self.sync_scrollbar.blockSignals(False)
+                            return
+
+        # Fallback: use scroll percentage
         scrollbar = self.left_panel.verticalScrollBar()
         if scrollbar.maximum() > 0:
             percent = int((scrollbar.value() / scrollbar.maximum()) * 100)
@@ -674,6 +1176,12 @@ class MainWindow(QMainWindow):
 
         compare_menu.addSeparator()
 
+        exclusion_zones = QAction("除外領域...", self)
+        exclusion_zones.triggered.connect(self._show_exclusion_zones_dialog)
+        compare_menu.addAction(exclusion_zones)
+
+        compare_menu.addSeparator()
+
         clear_links = QAction("Clear Manual Links", self)
         clear_links.triggered.connect(self._clear_manual_links)
         compare_menu.addAction(clear_links)
@@ -708,6 +1216,41 @@ class MainWindow(QMainWindow):
         compare_btn = QAction("Compare", self)
         compare_btn.triggered.connect(self._run_comparison)
         toolbar.addAction(compare_btn)
+
+        toolbar.addSeparator()
+
+        # Diff navigation buttons
+        prev_diff_btn = QAction("← Prev Diff", self)
+        prev_diff_btn.setShortcut("Ctrl+Up")
+        prev_diff_btn.triggered.connect(self._go_prev_diff)
+        toolbar.addAction(prev_diff_btn)
+
+        next_diff_btn = QAction("Next Diff →", self)
+        next_diff_btn.setShortcut("Ctrl+Down")
+        next_diff_btn.triggered.connect(self._go_next_diff)
+        toolbar.addAction(next_diff_btn)
+
+        toolbar.addSeparator()
+
+        # Diff summary button
+        diff_summary_btn = QAction("差分一覧", self)
+        diff_summary_btn.triggered.connect(self._show_diff_summary)
+        toolbar.addAction(diff_summary_btn)
+
+        toolbar.addSeparator()
+
+        # Color picker button
+        color_btn = QAction("ハイライト色", self)
+        color_btn.triggered.connect(self._pick_highlight_color)
+        toolbar.addAction(color_btn)
+
+        toolbar.addSeparator()
+
+        # Drawing mode toggle
+        self._draw_mode_action = QAction("除外領域描画", self)
+        self._draw_mode_action.setCheckable(True)
+        self._draw_mode_action.triggered.connect(self._toggle_drawing_mode)
+        toolbar.addAction(self._draw_mode_action)
 
         toolbar.addSeparator()
 
@@ -827,7 +1370,7 @@ class MainWindow(QMainWindow):
 
         # Phase 2: Compute differences for matched pairs
         progress.setLabelText("Computing differences...")
-        comparator = ImageComparator()
+        comparator = ImageComparator(highlight_color=self._highlight_color)
         matched_pairs = self.matching_result.get_matched_pairs()
         total_pairs = len(matched_pairs)
         self.diff_scores = {}  # Clear previous scores
@@ -868,12 +1411,17 @@ class MainWindow(QMainWindow):
         progress.close()
 
         self.session.matching_result = self.matching_result
+        self._current_diff_index = -1  # Reset diff navigation
 
         # Update UI
         self.left_panel.update_match_status(self.matching_result)
         self.right_panel.update_match_status(self.matching_result)
         self._update_links()
         self._update_status()
+
+        # Update diff summary dialog if open
+        if self._diff_summary_dialog and self._diff_summary_dialog.isVisible():
+            self._diff_summary_dialog.update_diff_list(self.matching_result, self.diff_scores)
 
     def _on_page_clicked(self, index: int, side: str) -> None:
         """Handle page click for manual linking and scroll to paired slide."""
@@ -1018,6 +1566,132 @@ class MainWindow(QMainWindow):
             self, "Export HTML",
             "HTML export will be implemented in the full version."
         )
+
+    def _show_exclusion_zones_dialog(self) -> None:
+        """Show the exclusion zones dialog."""
+        dialog = ExclusionZoneDialog(self, self.exclusion_zones)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.session.exclusion_zones = self.exclusion_zones
+            self._update_exclusion_zone_overlays()
+            self.statusbar.showMessage(
+                f"除外領域を更新しました ({len(self.exclusion_zones.zones)} 領域)"
+            )
+
+    def _toggle_drawing_mode(self, checked: bool) -> None:
+        """Toggle exclusion zone drawing mode."""
+        self._drawing_mode = checked
+        self.left_panel.set_drawing_mode(checked)
+        self.right_panel.set_drawing_mode(checked)
+
+        if checked:
+            self.statusbar.showMessage("除外領域描画モード: 画像上をドラッグして除外領域を指定してください")
+        else:
+            self.statusbar.showMessage("除外領域描画モードを終了しました")
+            self._update_exclusion_zone_overlays()
+
+    def _on_exclusion_zone_drawn(self, side: str, page_index: int, x: float, y: float, w: float, h: float) -> None:
+        """Handle exclusion zone drawn on a thumbnail."""
+        if side == "left":
+            applies_to = AppliesTo.LEFT
+        else:
+            applies_to = AppliesTo.RIGHT
+
+        zone_count = len(self.exclusion_zones.zones) + 1
+        zone = ExclusionZone(
+            x=x, y=y, width=w, height=h,
+            name=f"手動領域 {zone_count}",
+            applies_to=applies_to
+        )
+        self.exclusion_zones.add(zone)
+        self.session.exclusion_zones = self.exclusion_zones
+        self._update_exclusion_zone_overlays()
+
+        self.statusbar.showMessage(
+            f"除外領域を追加しました: {zone.name} ({x*100:.0f}%, {y*100:.0f}%, {w*100:.0f}%x{h*100:.0f}%)"
+        )
+
+    def _update_exclusion_zone_overlays(self) -> None:
+        """Update exclusion zone overlays on both panels."""
+        left_zones = self.exclusion_zones.get_zones_for("left")
+        right_zones = self.exclusion_zones.get_zones_for("right")
+        self.left_panel.update_exclusion_zones(left_zones)
+        self.right_panel.update_exclusion_zones(right_zones)
+
+    def _get_diff_pages(self) -> List[tuple]:
+        """Get list of (left_idx, right_idx) for pages with differences."""
+        if not self.matching_result:
+            return []
+        diff_pages = []
+        for match in self.matching_result.matches:
+            if match.status == MatchStatus.MATCHED:
+                has_diff = self.diff_scores.get((match.left_index, match.right_index), False)
+                if has_diff:
+                    diff_pages.append((match.left_index, match.right_index))
+        return diff_pages
+
+    def _go_prev_diff(self) -> None:
+        """Navigate to previous page with differences."""
+        diff_pages = self._get_diff_pages()
+        if not diff_pages:
+            self.statusbar.showMessage("差分がありません")
+            return
+
+        if self._current_diff_index <= 0:
+            self._current_diff_index = len(diff_pages) - 1
+        else:
+            self._current_diff_index -= 1
+
+        left_idx, right_idx = diff_pages[self._current_diff_index]
+        self.jump_to_page_pair(left_idx, right_idx)
+        self.statusbar.showMessage(f"差分 {self._current_diff_index + 1}/{len(diff_pages)}")
+
+    def _go_next_diff(self) -> None:
+        """Navigate to next page with differences."""
+        diff_pages = self._get_diff_pages()
+        if not diff_pages:
+            self.statusbar.showMessage("差分がありません")
+            return
+
+        if self._current_diff_index >= len(diff_pages) - 1:
+            self._current_diff_index = 0
+        else:
+            self._current_diff_index += 1
+
+        left_idx, right_idx = diff_pages[self._current_diff_index]
+        self.jump_to_page_pair(left_idx, right_idx)
+        self.statusbar.showMessage(f"差分 {self._current_diff_index + 1}/{len(diff_pages)}")
+
+    def jump_to_page_pair(self, left_idx: int, right_idx: int) -> None:
+        """Jump to a specific page pair."""
+        self.left_panel.scroll_to_page(left_idx)
+        self.right_panel.scroll_to_page(right_idx)
+        self.left_panel.set_selected(left_idx)
+        self.right_panel.set_selected(right_idx)
+        QTimer.singleShot(50, self._do_update_links)
+
+    def _show_diff_summary(self) -> None:
+        """Show the diff summary dialog."""
+        if self._diff_summary_dialog is None:
+            self._diff_summary_dialog = DiffSummaryDialog(self)
+            self._diff_summary_dialog.jump_requested.connect(self.jump_to_page_pair)
+
+        self._diff_summary_dialog.update_diff_list(self.matching_result, self.diff_scores)
+        self._diff_summary_dialog.show()
+        self._diff_summary_dialog.raise_()
+        self._diff_summary_dialog.activateWindow()
+
+    def _pick_highlight_color(self) -> None:
+        """Open color picker for highlight color."""
+        current = QColor(*self._highlight_color)
+        color = QColorDialog.getColor(current, self, "ハイライト色を選択")
+
+        if color.isValid():
+            self._highlight_color = (color.red(), color.green(), color.blue())
+            self.statusbar.showMessage(f"ハイライト色を変更しました: RGB{self._highlight_color}")
+
+            # Re-run comparison with new color if documents are loaded
+            if self.left_doc and self.right_doc and self.matching_result:
+                self._run_comparison()
 
     def resizeEvent(self, event) -> None:
         """Handle window resize."""
