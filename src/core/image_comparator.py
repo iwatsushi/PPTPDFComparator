@@ -114,12 +114,10 @@ class ImageComparator:
         arr1 = np.array(img1.convert('RGB'))
         arr2 = np.array(img2.convert('RGB'))
 
-        # Convert to grayscale for comparison
-        gray1 = cv2.cvtColor(arr1, cv2.COLOR_RGB2GRAY)
-        gray2 = cv2.cvtColor(arr2, cv2.COLOR_RGB2GRAY)
-
-        # Compute absolute difference
-        diff = cv2.absdiff(gray1, gray2)
+        # Compute absolute difference per channel and take maximum
+        # This detects color changes even when brightness is similar
+        diff_rgb = cv2.absdiff(arr1, arr2)
+        diff = np.max(diff_rgb, axis=2).astype(np.uint8)  # Max across R, G, B channels
 
         # Apply exclusion mask
         if exclusion_zones:
