@@ -4,7 +4,10 @@ import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
 
-from .gui_pyside import MainWindow
+try:
+    from src.gui_pyside import MainWindow
+except ImportError:
+    from gui_pyside import MainWindow
 
 
 def main():

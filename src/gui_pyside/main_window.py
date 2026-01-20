@@ -17,14 +17,23 @@ from PySide6.QtWidgets import (
     QToolBar, QStatusBar, QFileDialog, QMessageBox,
     QProgressDialog, QApplication, QFrame, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QGraphicsLineItem,
-    QGraphicsRectItem
+    QGraphicsRectItem, QSlider, QCheckBox
 )
 
-from ..core.document import Document
-from ..core.page_matcher import PageMatcher, MatchingResult, MatchStatus
-from ..core.exclusion_zone import ExclusionZoneSet
-from ..core.session import Session
-from ..utils.image_utils import pil_to_qpixmap
+try:
+    from src.core.document import Document
+    from src.core.page_matcher import PageMatcher, MatchingResult, MatchStatus
+    from src.core.image_comparator import ImageComparator, DiffResult
+    from src.core.exclusion_zone import ExclusionZoneSet
+    from src.core.session import Session
+    from src.utils.image_utils import pil_to_qpixmap
+except ImportError:
+    from core.document import Document
+    from core.page_matcher import PageMatcher, MatchingResult, MatchStatus
+    from core.image_comparator import ImageComparator, DiffResult
+    from core.exclusion_zone import ExclusionZoneSet
+    from core.session import Session
+    from utils.image_utils import pil_to_qpixmap
 
 
 class PageThumbnail(QFrame):
@@ -43,8 +52,11 @@ class PageThumbnail(QFrame):
         self.page_index = page_index
         self.side = side
         self._original_pixmap: Optional[QPixmap] = None
+        self._highlight_pixmap: Optional[QPixmap] = None
+        self._show_diff: bool = True
         self._selected = False
         self._match_status: Optional[MatchStatus] = None
+        self._diff_result: Optional[DiffResult] = None
 
         self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
         self.setLineWidth(2)
@@ -74,11 +86,23 @@ class PageThumbnail(QFrame):
     def set_pixmap(self, pixmap: QPixmap) -> None:
         """Set the thumbnail image."""
         self._original_pixmap = pixmap
+        self._highlight_pixmap = None
+        self._update_scaled_pixmap()
+
+    def set_diff_result(self, diff_result: Optional[DiffResult], highlight_pixmap: Optional[QPixmap] = None) -> None:
+        """Set the diff result and highlighted image."""
+        self._diff_result = diff_result
+        self._highlight_pixmap = highlight_pixmap
         self._update_scaled_pixmap()
 
     def _update_scaled_pixmap(self, target_width: Optional[int] = None) -> None:
         """Update the displayed pixmap scaled to target width."""
-        if self._original_pixmap is None:
+        # Choose which pixmap to display
+        pixmap_to_use = self._original_pixmap
+        if self._show_diff and self._highlight_pixmap is not None:
+            pixmap_to_use = self._highlight_pixmap
+
+        if pixmap_to_use is None:
             return
 
         if target_width is None:
@@ -92,12 +116,12 @@ class PageThumbnail(QFrame):
         target_width = max(100, target_width if target_width else 300)
 
         # Scale maintaining aspect ratio
-        orig_w = self._original_pixmap.width()
-        orig_h = self._original_pixmap.height()
+        orig_w = pixmap_to_use.width()
+        orig_h = pixmap_to_use.height()
         scale = target_width / orig_w
         target_height = int(orig_h * scale)
 
-        scaled = self._original_pixmap.scaled(
+        scaled = pixmap_to_use.scaled(
             target_width, target_height,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
@@ -263,7 +287,7 @@ class DocumentPanel(QScrollArea):
         """Update all thumbnail sizes based on current panel width."""
         target_width = self.width() - 50
         for thumb in self.thumbnails:
-            if thumb._original_pixmap is not None:
+            if thumb._original_pixmap is not None or thumb._highlight_pixmap is not None:
                 thumb._update_scaled_pixmap(target_width)
 
     def set_document(self, document: Document) -> None:
@@ -328,6 +352,11 @@ class DocumentPanel(QScrollArea):
 
         if index is not None and index < len(self.thumbnails):
             self.thumbnails[index].set_selected(True)
+
+    def set_diff_result(self, page_index: int, diff_result: DiffResult, highlight_pixmap: Optional[QPixmap] = None) -> None:
+        """Set diff result for a specific page thumbnail."""
+        if page_index < len(self.thumbnails):
+            self.thumbnails[page_index].set_diff_result(diff_result, highlight_pixmap)
 
     def update_match_status(self, result: MatchingResult) -> None:
         """Update thumbnails with match status."""
@@ -444,13 +473,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PPT/PDF Comparator (PySide6)")
-        self.setMinimumSize(600, 400)
-        self.resize(1200, 800)
+        self.setMinimumSize(800, 600)
+        self.resize(1600, 1000)
 
         self.session = Session()
         self.left_doc: Optional[Document] = None
         self.right_doc: Optional[Document] = None
         self.matching_result: Optional[MatchingResult] = None
+        self.exclusion_zones = ExclusionZoneSet()
 
         self._selected_left: Optional[int] = None
         self._selected_right: Optional[int] = None
@@ -463,14 +493,23 @@ class MainWindow(QMainWindow):
         # Enable drag and drop on main window
         self.setAcceptDrops(True)
 
+        # Show maximized after all initialization
+        self.showMaximized()
+
     def _setup_ui(self) -> None:
         """Set up the main UI layout."""
         central = QWidget()
         self.setCentralWidget(central)
 
-        main_layout = QHBoxLayout(central)
+        main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
+
+        # Content area
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
 
         # Create splitter for resizable panels
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -491,21 +530,101 @@ class MainWindow(QMainWindow):
 
         self.splitter.addWidget(self.left_panel)
         self.splitter.addWidget(self.right_panel)
-        self.splitter.setSizes([600, 600])
+        self.splitter.setSizes([800, 800])
 
-        main_layout.addWidget(self.splitter)
+        content_layout.addWidget(self.splitter)
+        main_layout.addWidget(content_widget, 1)
+
+        # Bottom sync scroll bar area
+        sync_widget = QWidget()
+        sync_widget.setStyleSheet("background-color: #dcdcdc;")
+        sync_widget.setMinimumHeight(40)
+        sync_layout = QHBoxLayout(sync_widget)
+        sync_layout.setContentsMargins(10, 5, 10, 5)
+
+        sync_label = QLabel("連動スクロール:")
+        sync_label.setStyleSheet("color: #505050;")
+        sync_layout.addWidget(sync_label)
+
+        self.sync_scrollbar = QSlider(Qt.Orientation.Horizontal)
+        self.sync_scrollbar.setMinimum(0)
+        self.sync_scrollbar.setMaximum(100)
+        self.sync_scrollbar.setValue(0)
+        self.sync_scrollbar.valueChanged.connect(self._on_sync_scroll)
+        sync_layout.addWidget(self.sync_scrollbar, 1)
+
+        self.sync_checkbox = QCheckBox("連動")
+        self.sync_checkbox.setChecked(False)
+        self.sync_checkbox.stateChanged.connect(self._on_sync_toggle)
+        sync_layout.addWidget(self.sync_checkbox)
+
+        main_layout.addWidget(sync_widget)
 
         # Link overlay (positioned over entire window)
-        self.link_overlay = LinkOverlay(central)
+        self.link_overlay = LinkOverlay(content_widget)
 
         # Update overlay on scroll
-        self.left_panel.verticalScrollBar().valueChanged.connect(self._update_links)
-        self.right_panel.verticalScrollBar().valueChanged.connect(self._update_links)
+        self.left_panel.verticalScrollBar().valueChanged.connect(self._on_panel_scroll)
+        self.right_panel.verticalScrollBar().valueChanged.connect(self._on_panel_scroll)
 
         # Timer for delayed link updates
         self.link_update_timer = QTimer()
         self.link_update_timer.setSingleShot(True)
         self.link_update_timer.timeout.connect(self._do_update_links)
+
+    def _on_panel_scroll(self) -> None:
+        """Handle scroll event from document panels."""
+        # Sync scroll if enabled
+        if self.sync_checkbox.isChecked():
+            sender = self.sender()
+            if sender == self.left_panel.verticalScrollBar():
+                self._sync_scroll_from(self.left_panel, self.right_panel)
+            elif sender == self.right_panel.verticalScrollBar():
+                self._sync_scroll_from(self.right_panel, self.left_panel)
+
+        self._update_links()
+        self._update_sync_scrollbar()
+
+    def _on_sync_scroll(self, value: int) -> None:
+        """Handle sync scrollbar movement."""
+        if not self.left_doc or not self.right_doc:
+            return
+
+        percent = value / 100.0
+        self._scroll_panel_to_percent(self.left_panel, percent)
+        self._scroll_panel_to_percent(self.right_panel, percent)
+        self._update_links()
+
+    def _on_sync_toggle(self, state: int) -> None:
+        """Handle sync checkbox toggle."""
+        if state:
+            self._update_sync_scrollbar()
+
+    def _sync_scroll_from(self, source: DocumentPanel, target: DocumentPanel) -> None:
+        """Sync scroll position from source to target panel."""
+        source_bar = source.verticalScrollBar()
+        target_bar = target.verticalScrollBar()
+
+        source_range = source_bar.maximum()
+        if source_range > 0:
+            percent = source_bar.value() / source_range
+            target_pos = int(percent * target_bar.maximum())
+            target_bar.setValue(target_pos)
+
+    def _scroll_panel_to_percent(self, panel: DocumentPanel, percent: float) -> None:
+        """Scroll panel to a percentage position."""
+        scrollbar = panel.verticalScrollBar()
+        pos = int(percent * scrollbar.maximum())
+        scrollbar.setValue(pos)
+
+    def _update_sync_scrollbar(self) -> None:
+        """Update sync scrollbar position based on panel scroll."""
+        scrollbar = self.left_panel.verticalScrollBar()
+        if scrollbar.maximum() > 0:
+            percent = int((scrollbar.value() / scrollbar.maximum()) * 100)
+            self.sync_scrollbar.blockSignals(True)
+            self.sync_scrollbar.setValue(min(100, max(0, percent)))
+            self.sync_scrollbar.blockSignals(False)
 
     def _setup_menu(self) -> None:
         """Set up the menu bar."""
@@ -666,6 +785,10 @@ class MainWindow(QMainWindow):
             self._update_status()
             self._update_links()
 
+            # Auto-compare if both documents are loaded
+            if self.left_doc and self.right_doc:
+                QTimer.singleShot(100, self._run_comparison)
+
         except Exception as e:
             QMessageBox.critical(
                 self, "Error",
@@ -693,11 +816,48 @@ class MainWindow(QMainWindow):
             progress.setValue(int(current / total * 100) if total > 0 else 0)
             QApplication.processEvents()
 
+        # Phase 1: Match pages
         matcher = PageMatcher()
         self.matching_result = matcher.match(
             self.left_doc, self.right_doc,
             progress_callback=progress_callback
         )
+
+        # Phase 2: Compute differences for matched pairs
+        progress.setLabelText("Computing differences...")
+        comparator = ImageComparator()
+        matched_pairs = self.matching_result.get_matched_pairs()
+        total_pairs = len(matched_pairs)
+
+        for i, (left_idx, right_idx, score) in enumerate(matched_pairs):
+            progress.setValue(int((i + 1) / total_pairs * 100) if total_pairs > 0 else 100)
+            progress.setLabelText(f"Computing diff {i + 1}/{total_pairs}...")
+            QApplication.processEvents()
+
+            left_page = self.left_doc.pages[left_idx]
+            right_page = self.right_doc.pages[right_idx]
+
+            if left_page.thumbnail and right_page.thumbnail:
+                # Compare the images
+                diff_result = comparator.compare(
+                    left_page.thumbnail, right_page.thumbnail,
+                    exclusion_zones=self.exclusion_zones.get_zones_for("left")
+                )
+
+                # Apply highlighted images to thumbnails
+                if diff_result.highlight_image:
+                    left_highlight_pixmap = pil_to_qpixmap(diff_result.highlight_image)
+                    self.left_panel.set_diff_result(left_idx, diff_result, left_highlight_pixmap)
+
+                    # Also create highlight for right side
+                    diff_result_right = comparator.compare(
+                        right_page.thumbnail, left_page.thumbnail,
+                        exclusion_zones=self.exclusion_zones.get_zones_for("right")
+                    )
+                    if diff_result_right.highlight_image:
+                        right_highlight_pixmap = pil_to_qpixmap(diff_result_right.highlight_image)
+                        self.right_panel.set_diff_result(right_idx, diff_result_right, right_highlight_pixmap)
+
         progress.close()
 
         self.session.matching_result = self.matching_result
@@ -727,7 +887,6 @@ class MainWindow(QMainWindow):
 
     def _on_page_double_clicked(self, index: int, side: str) -> None:
         """Handle page double click for viewing details."""
-        # TODO: Open detail view with diff highlighting
         pass
 
     def _create_manual_link(self, left_index: int, right_index: int) -> None:
@@ -749,7 +908,6 @@ class MainWindow(QMainWindow):
     def _clear_manual_links(self) -> None:
         """Clear all manual links."""
         if self.matching_result:
-            # Re-run automatic matching
             self._run_comparison()
 
     def _update_links(self) -> None:
