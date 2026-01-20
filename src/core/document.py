@@ -304,7 +304,7 @@ class Document:
     pages: List[Page] = field(default_factory=list)
     _loaded: bool = False
     _hashes_computed: bool = False
-    _thumbnail_size: tuple[int, int] = field(default=(800, 600), repr=False)
+    _thumbnail_size: tuple[int, int] = field(default=(1200, 900), repr=False)
 
     @classmethod
     def from_file(cls, file_path: str | Path) -> Document:
@@ -342,7 +342,7 @@ class Document:
 
     def load(
         self,
-        thumbnail_size: tuple[int, int] = (800, 600),
+        thumbnail_size: tuple[int, int] = (1200, 900),  # 高画質サムネイル
         full_dpi: int = 200,
         progress_callback: Optional[callable] = None,
         use_cache: bool = True
@@ -593,8 +593,8 @@ class Document:
                     pass  # Fall through to individual export
 
                 # Method 2: Individual slide export (fallback)
-                # Use lower resolution for speed (1280px instead of 1920px * dpi factor)
-                export_width = 1280
+                # High resolution export for better quality
+                export_width = 1920
 
                 for i in range(1, total + 1):
                     if progress_callback:
