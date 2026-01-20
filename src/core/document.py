@@ -210,6 +210,7 @@ class Document:
     ) -> None:
         """Convert PPTX to images using PowerPoint COM automation (Windows only)."""
         import sys
+        import time
         if sys.platform != 'win32':
             raise RuntimeError("PowerPoint COM is only available on Windows")
 
@@ -222,15 +223,23 @@ class Document:
         presentation = None
         try:
             # Initialize COM
+            comtypes.client.CoInitialize()
             powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
             powerpoint.Visible = 1  # Must be visible for export
 
-            # Open presentation
+            # Give PowerPoint time to initialize
+            time.sleep(0.5)
+
+            # Open presentation with window (some environments need this)
             presentation = powerpoint.Presentations.Open(
                 str(self.path.absolute()),
                 ReadOnly=True,
-                WithWindow=False
+                Untitled=False,
+                WithWindow=True  # Changed to True for better compatibility
             )
+
+            # Wait for presentation to fully load
+            time.sleep(0.5)
 
             total = presentation.Slides.Count
             self.pages = []
@@ -249,9 +258,18 @@ class Document:
                     # Export slide as image (width based on DPI)
                     # PowerPoint default is 96 DPI, we want higher
                     export_width = int(1920 * (full_dpi / 96))
-                    slide.Export(str(img_path), "PNG", export_width)
 
-                    if img_path.exists():
+                    # Try export with retries
+                    for retry in range(3):
+                        try:
+                            slide.Export(str(img_path), "PNG", export_width)
+                            time.sleep(0.1)  # Small delay for file write
+                            if img_path.exists() and img_path.stat().st_size > 0:
+                                break
+                        except Exception:
+                            time.sleep(0.2)
+
+                    if img_path.exists() and img_path.stat().st_size > 0:
                         img = Image.open(img_path)
                         thumbnail = img.copy()
                         thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
@@ -260,13 +278,23 @@ class Document:
                         page.compute_phash()
                         self.pages.append(page)
                     else:
-                        raise RuntimeError(f"Failed to export slide {i}")
+                        # Create placeholder if export failed
+                        thumbnail = Image.new('RGB', thumbnail_size, color=(200, 200, 200))
+                        page = Page(index=i - 1, thumbnail=thumbnail)
+                        page.compute_phash()
+                        self.pages.append(page)
 
         finally:
-            if presentation:
-                presentation.Close()
-            if powerpoint:
-                powerpoint.Quit()
+            try:
+                if presentation:
+                    presentation.Close()
+            except Exception:
+                pass
+            try:
+                if powerpoint:
+                    powerpoint.Quit()
+            except Exception:
+                pass
 
     def _convert_pptx_via_pdf(
         self,

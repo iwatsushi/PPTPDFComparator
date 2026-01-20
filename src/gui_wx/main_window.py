@@ -42,13 +42,20 @@ class PageThumbnailPanel(wx.Panel):
         self._match_status: Optional[MatchStatus] = None
         self._diff_result: Optional[DiffResult] = None
 
+        # Exclusion zone drawing state
+        self._drawing_mode: bool = False
+        self._draw_start: Optional[wx.Point] = None
+        self._draw_current: Optional[wx.Point] = None
+        self._exclusion_zones: List[tuple] = []  # List of (x, y, w, h) in normalized coords
+
         self.SetBackgroundColour(wx.WHITE)
 
         self.sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Image display
-        self.image_ctrl = wx.StaticBitmap(self)
-        self.sizer.Add(self.image_ctrl, 1, wx.ALL | wx.EXPAND, 5)
+        # Image display - use a panel for custom drawing
+        self.image_panel = wx.Panel(self)
+        self.image_panel.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.sizer.Add(self.image_panel, 1, wx.ALL | wx.EXPAND, 5)
 
         # Page label
         self.page_label = wx.StaticText(self, label=f"Page {page_index + 1}")
@@ -57,12 +64,19 @@ class PageThumbnailPanel(wx.Panel):
 
         self.SetSizer(self.sizer)
 
+        # For backward compatibility, keep image_ctrl as alias
+        self.image_ctrl = self.image_panel
+        self._scaled_bitmap: Optional[wx.Bitmap] = None
+
         # Bind events
         self.Bind(wx.EVT_LEFT_DOWN, self._on_click)
         self.Bind(wx.EVT_LEFT_DCLICK, self._on_double_click)
         self.Bind(wx.EVT_SIZE, self._on_resize)
-        self.image_ctrl.Bind(wx.EVT_LEFT_DOWN, self._on_click)
-        self.image_ctrl.Bind(wx.EVT_LEFT_DCLICK, self._on_double_click)
+        self.image_panel.Bind(wx.EVT_LEFT_DOWN, self._on_image_click)
+        self.image_panel.Bind(wx.EVT_LEFT_UP, self._on_image_release)
+        self.image_panel.Bind(wx.EVT_MOTION, self._on_image_motion)
+        self.image_panel.Bind(wx.EVT_PAINT, self._on_image_paint)
+        self.image_panel.Bind(wx.EVT_LEFT_DCLICK, self._on_double_click)
 
     def set_bitmap(self, bitmap: wx.Bitmap) -> None:
         """Set the thumbnail image."""
@@ -74,9 +88,8 @@ class PageThumbnailPanel(wx.Panel):
         """Set the diff result and highlighted image."""
         self._diff_result = diff_result
         self._highlight_bitmap = highlight_image
-        print(f"[DEBUG] set_diff_result called for page {self.page_index}: highlight_bitmap={highlight_image is not None}, show_diff={self._show_diff}")
 
-        # 直接image_ctrlに設定
+        # Update scaled bitmap and refresh
         if self._show_diff and self._highlight_bitmap is not None:
             img = self._highlight_bitmap.ConvertToImage()
             parent = self.GetParent()
@@ -88,13 +101,115 @@ class PageThumbnailPanel(wx.Panel):
                 new_w = int(orig_w * scale)
                 new_h = int(orig_h * scale)
                 img = img.Scale(new_w, new_h, wx.IMAGE_QUALITY_HIGH)
-                scaled_bitmap = wx.Bitmap(img)
-                self.image_ctrl.SetBitmap(scaled_bitmap)
-                print(f"[DEBUG] Directly set highlight bitmap for page {self.page_index}")
+                self._scaled_bitmap = wx.Bitmap(img)
 
         self.Layout()
-        self.Refresh()
+        self.image_panel.Refresh()
         self.Update()
+
+    def set_drawing_mode(self, enabled: bool) -> None:
+        """Enable or disable exclusion zone drawing mode."""
+        self._drawing_mode = enabled
+        if enabled:
+            self.image_panel.SetCursor(wx.Cursor(wx.CURSOR_CROSS))
+        else:
+            self.image_panel.SetCursor(wx.NullCursor)
+        self._draw_start = None
+        self._draw_current = None
+        self.image_panel.Refresh()
+
+    def set_exclusion_zones(self, zones: List[tuple]) -> None:
+        """Set exclusion zones to display as overlays."""
+        self._exclusion_zones = zones
+        self.image_panel.Refresh()
+
+    def _on_image_paint(self, event: wx.PaintEvent) -> None:
+        """Paint the image with exclusion zone overlays."""
+        dc = wx.AutoBufferedPaintDC(self.image_panel)
+        dc.Clear()
+
+        # Draw the scaled bitmap
+        if self._scaled_bitmap:
+            dc.DrawBitmap(self._scaled_bitmap, 0, 0)
+
+        # Get image size for coordinate conversion
+        if not self._scaled_bitmap:
+            return
+        img_w = self._scaled_bitmap.GetWidth()
+        img_h = self._scaled_bitmap.GetHeight()
+
+        # Draw existing exclusion zones
+        dc.SetBrush(wx.Brush(wx.Colour(255, 0, 0, 64), wx.BRUSHSTYLE_BDIAGONAL_HATCH))
+        dc.SetPen(wx.Pen(wx.Colour(255, 0, 0), 2, wx.PENSTYLE_DOT))
+        for x, y, w, h in self._exclusion_zones:
+            rect_x = int(x * img_w)
+            rect_y = int(y * img_h)
+            rect_w = int(w * img_w)
+            rect_h = int(h * img_h)
+            dc.DrawRectangle(rect_x, rect_y, rect_w, rect_h)
+
+        # Draw current selection rectangle
+        if self._drawing_mode and self._draw_start and self._draw_current:
+            dc.SetBrush(wx.Brush(wx.Colour(0, 120, 215, 50)))
+            dc.SetPen(wx.Pen(wx.Colour(0, 120, 215), 2))
+            x1, y1 = self._draw_start
+            x2, y2 = self._draw_current
+            rect = wx.Rect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+            dc.DrawRectangle(rect)
+
+    def _on_image_click(self, event: wx.MouseEvent) -> None:
+        """Handle click on image panel."""
+        if self._drawing_mode:
+            self._draw_start = event.GetPosition()
+            self._draw_current = self._draw_start
+            self.image_panel.CaptureMouse()
+        else:
+            self._on_click(event)
+
+    def _on_image_release(self, event: wx.MouseEvent) -> None:
+        """Handle mouse release on image panel."""
+        if self.image_panel.HasCapture():
+            self.image_panel.ReleaseMouse()
+
+        if self._drawing_mode and self._draw_start and self._draw_current:
+            # Calculate normalized coordinates
+            if self._scaled_bitmap:
+                img_w = self._scaled_bitmap.GetWidth()
+                img_h = self._scaled_bitmap.GetHeight()
+
+                x1, y1 = self._draw_start
+                x2, y2 = self._draw_current
+
+                # Normalize to 0-1 range
+                nx = min(x1, x2) / img_w
+                ny = min(y1, y2) / img_h
+                nw = abs(x2 - x1) / img_w
+                nh = abs(y2 - y1) / img_h
+
+                # Only add if zone is large enough (at least 1% in each dimension)
+                if nw > 0.01 and nh > 0.01:
+                    # Notify parent to add exclusion zone
+                    self._notify_exclusion_zone_added(nx, ny, nw, nh)
+
+            self._draw_start = None
+            self._draw_current = None
+            self.image_panel.Refresh()
+
+    def _on_image_motion(self, event: wx.MouseEvent) -> None:
+        """Handle mouse motion on image panel."""
+        if self._drawing_mode and event.Dragging() and event.LeftIsDown():
+            self._draw_current = event.GetPosition()
+            self.image_panel.Refresh()
+
+    def _notify_exclusion_zone_added(self, x: float, y: float, w: float, h: float) -> None:
+        """Notify parent that an exclusion zone was drawn."""
+        # Find MainWindow ancestor
+        parent = self.GetParent()
+        while parent:
+            if hasattr(parent, 'on_exclusion_zone_drawn'):
+                parent.on_exclusion_zone_drawn(self.side, self.page_index, x, y, w, h)
+                return
+            parent = parent.GetParent()
 
     def _update_scaled_bitmap(self) -> None:
         """Update the displayed bitmap scaled to current size."""
@@ -102,7 +217,6 @@ class PageThumbnailPanel(wx.Panel):
         bitmap_to_use = self._original_bitmap
         if self._show_diff and self._highlight_bitmap is not None:
             bitmap_to_use = self._highlight_bitmap
-            print(f"[DEBUG] Using highlight bitmap for page {self.page_index}")
 
         if bitmap_to_use is None:
             return
@@ -125,11 +239,14 @@ class PageThumbnailPanel(wx.Panel):
         new_h = int(orig_h * scale)
 
         img = img.Scale(new_w, new_h, wx.IMAGE_QUALITY_HIGH)
-        scaled_bitmap = wx.Bitmap(img)
-        self.image_ctrl.SetBitmap(scaled_bitmap)
+        self._scaled_bitmap = wx.Bitmap(img)
+
+        # Update image panel size and trigger repaint
+        self.image_panel.SetMinSize(wx.Size(new_w, new_h))
+        self.image_panel.Refresh()
 
         # Update panel size
-        self.SetMinSize((new_w + 20, new_h + 40))
+        self.SetMinSize(wx.Size(new_w + 20, new_h + 40))
         self.Layout()
         self.Refresh()
 
@@ -273,7 +390,6 @@ class DocumentPanel(scrolled.ScrolledPanel):
 
     def _rebuild_thumbnails(self) -> None:
         """Rebuild thumbnail widgets from document."""
-        print(f"[DEBUG] _rebuild_thumbnails called, document={self.document}")
 
         # Clear existing
         for thumb in self.thumbnails:
@@ -286,22 +402,16 @@ class DocumentPanel(scrolled.ScrolledPanel):
 
         self.placeholder.Hide()
 
-        print(f"[DEBUG] Creating {len(self.document.pages)} thumbnails")
-
         # Create thumbnails
         for page in self.document.pages:
             thumb = PageThumbnailPanel(self, page.index, self.side)
 
             if page.thumbnail:
-                print(f"[DEBUG] Page {page.index}: Converting PIL image {page.thumbnail.size} to bitmap")
                 try:
                     bitmap = pil_to_wxbitmap(page.thumbnail)
-                    print(f"[DEBUG] Page {page.index}: Bitmap created, size={bitmap.GetWidth()}x{bitmap.GetHeight()}")
                     thumb.set_bitmap(bitmap)
-                except Exception as e:
-                    print(f"[DEBUG] Page {page.index}: Error converting to bitmap: {e}")
-            else:
-                print(f"[DEBUG] Page {page.index}: No thumbnail")
+                except Exception:
+                    pass  # Silently ignore bitmap conversion errors
 
             self.thumbnails.append(thumb)
             self.sizer.Add(thumb, 0, wx.ALL | wx.EXPAND, 5)
@@ -309,7 +419,6 @@ class DocumentPanel(scrolled.ScrolledPanel):
         self.SetupScrolling(scroll_x=False, scroll_y=True)
         self.Layout()
         self.Refresh()
-        print(f"[DEBUG] _rebuild_thumbnails complete, {len(self.thumbnails)} thumbnails created")
 
     def set_selected(self, index: Optional[int]) -> None:
         """Set selected page."""
@@ -375,6 +484,28 @@ class DocumentPanel(scrolled.ScrolledPanel):
 
         # Scroll to position
         self.Scroll(-1, target_y // scroll_unit)
+
+    def set_drawing_mode(self, enabled: bool) -> None:
+        """Enable or disable exclusion zone drawing mode on all thumbnails."""
+        for thumb in self.thumbnails:
+            thumb.set_drawing_mode(enabled)
+
+    def update_exclusion_zones(self, zones: List[ExclusionZone]) -> None:
+        """Update exclusion zone overlays on all thumbnails."""
+        # Convert zones to normalized coordinates for display
+        zone_tuples = [(z.x, z.y, z.width, z.height) for z in zones if z.enabled]
+        for thumb in self.thumbnails:
+            # Filter zones by side
+            applicable_zones = []
+            for z in zones:
+                if z.enabled:
+                    if z.applies_to == AppliesTo.BOTH:
+                        applicable_zones.append((z.x, z.y, z.width, z.height))
+                    elif z.applies_to == AppliesTo.LEFT and self.side == "left":
+                        applicable_zones.append((z.x, z.y, z.width, z.height))
+                    elif z.applies_to == AppliesTo.RIGHT and self.side == "right":
+                        applicable_zones.append((z.x, z.y, z.width, z.height))
+            thumb.set_exclusion_zones(applicable_zones)
 
 
 class FileDropTarget(wx.FileDropTarget):
@@ -611,6 +742,146 @@ class ExclusionZoneDialog(wx.Dialog):
             self.zone_set.zones[idx].enabled = self.zone_list.IsChecked(idx)
 
 
+class DiffSummaryDialog(wx.Frame):
+    """Modeless dialog showing pages with differences."""
+
+    def __init__(self, parent: wx.Window):
+        super().__init__(
+            parent,
+            title="差分一覧",
+            size=(400, 500),
+            style=wx.DEFAULT_FRAME_STYLE | wx.FRAME_FLOAT_ON_PARENT
+        )
+        self.parent = parent
+        self.diff_pages: List[tuple] = []  # [(left_idx, right_idx, has_diff), ...]
+
+        self._setup_ui()
+        self.Centre()
+
+    def _setup_ui(self) -> None:
+        """Set up the dialog UI."""
+        panel = wx.Panel(self)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Header
+        header = wx.StaticText(panel, label="差分があるページ一覧")
+        header.SetFont(wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        main_sizer.Add(header, 0, wx.ALL, 10)
+
+        # List control
+        self.list_ctrl = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.list_ctrl.InsertColumn(0, "Left Page", width=80)
+        self.list_ctrl.InsertColumn(1, "Right Page", width=80)
+        self.list_ctrl.InsertColumn(2, "Status", width=100)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self._on_item_activated)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_item_selected)
+        main_sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+
+        # Summary
+        self.summary_label = wx.StaticText(panel, label="")
+        main_sizer.Add(self.summary_label, 0, wx.ALL, 10)
+
+        # Buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        jump_btn = wx.Button(panel, label="ジャンプ")
+        jump_btn.Bind(wx.EVT_BUTTON, self._on_jump)
+        btn_sizer.Add(jump_btn, 0, wx.RIGHT, 5)
+
+        export_btn = wx.Button(panel, label="CSVエクスポート")
+        export_btn.Bind(wx.EVT_BUTTON, self._on_export)
+        btn_sizer.Add(export_btn, 0)
+
+        main_sizer.Add(btn_sizer, 0, wx.ALL | wx.ALIGN_RIGHT, 10)
+
+        panel.SetSizer(main_sizer)
+
+    def update_diff_list(self, matching_result: Optional[MatchingResult], diff_scores: dict) -> None:
+        """Update the list with current diff information."""
+        self.list_ctrl.DeleteAllItems()
+        self.diff_pages = []
+
+        if not matching_result:
+            self.summary_label.SetLabel("比較結果がありません")
+            return
+
+        diff_count = 0
+        identical_count = 0
+        unmatched_count = 0
+
+        for match in matching_result.matches:
+            if match.status == MatchStatus.MATCHED:
+                has_diff = diff_scores.get((match.left_index, match.right_index), False)
+                if has_diff:
+                    diff_count += 1
+                    status = "差分あり"
+                else:
+                    identical_count += 1
+                    status = "同一"
+
+                self.diff_pages.append((match.left_index, match.right_index, has_diff))
+                idx = self.list_ctrl.InsertItem(self.list_ctrl.GetItemCount(), str(match.left_index + 1))
+                self.list_ctrl.SetItem(idx, 1, str(match.right_index + 1))
+                self.list_ctrl.SetItem(idx, 2, status)
+
+                # Color code
+                if has_diff:
+                    self.list_ctrl.SetItemBackgroundColour(idx, wx.Colour(255, 200, 200))
+                else:
+                    self.list_ctrl.SetItemBackgroundColour(idx, wx.Colour(200, 255, 200))
+            else:
+                unmatched_count += 1
+
+        self.summary_label.SetLabel(
+            f"差分あり: {diff_count}  同一: {identical_count}  未マッチ: {unmatched_count}"
+        )
+
+    def _on_item_activated(self, event: wx.ListEvent) -> None:
+        """Handle double click on item."""
+        self._jump_to_selected()
+
+    def _on_item_selected(self, event: wx.ListEvent) -> None:
+        """Handle item selection."""
+        pass
+
+    def _on_jump(self, event: wx.Event) -> None:
+        """Jump to selected page."""
+        self._jump_to_selected()
+
+    def _jump_to_selected(self) -> None:
+        """Jump to the selected page in main window."""
+        sel = self.list_ctrl.GetFirstSelected()
+        if sel != wx.NOT_FOUND and sel < len(self.diff_pages):
+            left_idx, right_idx, _ = self.diff_pages[sel]
+            if hasattr(self.parent, 'jump_to_page_pair'):
+                self.parent.jump_to_page_pair(left_idx, right_idx)
+
+    def _on_export(self, event: wx.Event) -> None:
+        """Export diff list to CSV."""
+        with wx.FileDialog(
+            self,
+            "Export CSV",
+            wildcard="CSV Files (*.csv)|*.csv",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT
+        ) as dialog:
+            if dialog.ShowModal() == wx.ID_CANCEL:
+                return
+
+            path = dialog.GetPath()
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write("Left Page,Right Page,Status\n")
+                    for left_idx, right_idx, has_diff in self.diff_pages:
+                        status = "差分あり" if has_diff else "同一"
+                        f.write(f"{left_idx + 1},{right_idx + 1},{status}\n")
+                wx.MessageBox(f"エクスポート完了: {path}", "完了", wx.OK | wx.ICON_INFORMATION)
+            except Exception as e:
+                wx.MessageBox(f"エクスポート失敗: {e}", "エラー", wx.OK | wx.ICON_ERROR)
+
+    def get_diff_page_indices(self) -> List[tuple]:
+        """Get list of (left_idx, right_idx) for pages with differences."""
+        return [(left, right) for left, right, has_diff in self.diff_pages if has_diff]
+
+
 class MainWindow(wx.Frame):
     """Main application window."""
 
@@ -628,10 +899,19 @@ class MainWindow(wx.Frame):
         self.right_doc: Optional[Document] = None
         self.matching_result: Optional[MatchingResult] = None
         self.exclusion_zones = ExclusionZoneSet()
-        self.diff_scores: dict = {}  # (left_idx, right_idx) -> diff_score
+        self.diff_scores: dict = {}  # (left_idx, right_idx) -> has_differences
 
         self._selected_left: Optional[int] = None
         self._selected_right: Optional[int] = None
+        self._current_diff_index: int = -1  # Current position in diff navigation
+        self._highlight_color: tuple = (255, 0, 0)  # RGB for highlight
+        self._drawing_mode: bool = False  # Exclusion zone drawing mode
+
+        # Modeless dialogs
+        self._diff_summary_dialog: Optional[DiffSummaryDialog] = None
+
+        # Performance: batch updates
+        self._update_pending = False
 
         self._setup_ui()
         self._setup_menu()
@@ -642,6 +922,9 @@ class MainWindow(wx.Frame):
         self.SetDropTarget(MainDropTarget(self))
 
         self.Centre()
+
+        # Bind close event
+        self.Bind(wx.EVT_CLOSE, self._on_close)
 
     def _setup_ui(self) -> None:
         """Set up the main UI layout."""
@@ -767,16 +1050,50 @@ class MainWindow(wx.Frame):
         toolbar.AddSeparator()
         compare_btn = toolbar.AddTool(wx.ID_ANY, "Compare", wx.ArtProvider.GetBitmap(wx.ART_FIND))
         toolbar.AddSeparator()
+
+        # Diff navigation buttons
+        prev_diff_btn = toolbar.AddTool(wx.ID_ANY, "Prev Diff", wx.ArtProvider.GetBitmap(wx.ART_GO_UP), shortHelp="前の差分 (Ctrl+Up)")
+        next_diff_btn = toolbar.AddTool(wx.ID_ANY, "Next Diff", wx.ArtProvider.GetBitmap(wx.ART_GO_DOWN), shortHelp="次の差分 (Ctrl+Down)")
+        toolbar.AddSeparator()
+
+        # Diff summary button
+        diff_summary_btn = toolbar.AddTool(wx.ID_ANY, "Diff List", wx.ArtProvider.GetBitmap(wx.ART_LIST_VIEW), shortHelp="差分一覧")
+        toolbar.AddSeparator()
+
+        # Color picker button
+        color_btn = toolbar.AddTool(wx.ID_ANY, "Color", wx.ArtProvider.GetBitmap(wx.ART_HELP_SETTINGS), shortHelp="ハイライト色")
+        toolbar.AddSeparator()
+
+        # Exclusion zone drawing mode toggle
+        self._draw_mode_btn = toolbar.AddCheckTool(
+            wx.ID_ANY, "Draw Zone",
+            wx.ArtProvider.GetBitmap(wx.ART_CUT),
+            shortHelp="除外領域描画モード"
+        )
+        toolbar.AddSeparator()
+
         export_pdf_btn = toolbar.AddTool(wx.ID_ANY, "Export PDF", wx.ArtProvider.GetBitmap(wx.ART_FILE_SAVE))
         export_html_btn = toolbar.AddTool(wx.ID_ANY, "Export HTML", wx.ArtProvider.GetBitmap(wx.ART_FILE_SAVE_AS))
 
         self.Bind(wx.EVT_TOOL, self._open_left_file, open_left_btn)
         self.Bind(wx.EVT_TOOL, self._open_right_file, open_right_btn)
         self.Bind(wx.EVT_TOOL, self._run_comparison, compare_btn)
+        self.Bind(wx.EVT_TOOL, self._go_prev_diff, prev_diff_btn)
+        self.Bind(wx.EVT_TOOL, self._go_next_diff, next_diff_btn)
+        self.Bind(wx.EVT_TOOL, self._show_diff_summary, diff_summary_btn)
+        self.Bind(wx.EVT_TOOL, self._pick_highlight_color, color_btn)
+        self.Bind(wx.EVT_TOOL, self._toggle_drawing_mode, self._draw_mode_btn)
         self.Bind(wx.EVT_TOOL, self._export_pdf, export_pdf_btn)
         self.Bind(wx.EVT_TOOL, self._export_html, export_html_btn)
 
         toolbar.Realize()
+
+        # Keyboard shortcuts for navigation
+        accel_tbl = wx.AcceleratorTable([
+            (wx.ACCEL_CTRL, wx.WXK_UP, prev_diff_btn.GetId()),
+            (wx.ACCEL_CTRL, wx.WXK_DOWN, next_diff_btn.GetId()),
+        ])
+        self.SetAcceleratorTable(accel_tbl)
 
     def _setup_statusbar(self) -> None:
         """Set up the status bar."""
@@ -813,10 +1130,8 @@ class MainWindow(wx.Frame):
 
     def _load_document(self, path: str, side: str) -> None:
         """Load a document file."""
-        import traceback
         try:
             doc = Document.from_file(path)
-            print(f"[DEBUG] Document created: {doc.path}, type: {doc.doc_type}")
 
             # Show progress dialog
             progress = wx.ProgressDialog(
@@ -834,10 +1149,6 @@ class MainWindow(wx.Frame):
             doc.load(progress_callback=progress_callback)
             progress.Destroy()
 
-            print(f"[DEBUG] Document loaded: {doc.page_count} pages")
-            for i, page in enumerate(doc.pages[:3]):  # Show first 3 pages info
-                print(f"[DEBUG] Page {i}: thumbnail={page.thumbnail}, size={page.thumbnail.size if page.thumbnail else 'None'}")
-
             if side == "left":
                 self.left_doc = doc
                 self.left_panel.set_document(doc)
@@ -854,9 +1165,8 @@ class MainWindow(wx.Frame):
                 wx.CallAfter(self._run_comparison, None)
 
         except Exception as e:
-            traceback.print_exc()
             wx.MessageBox(
-                f"Failed to load document:\n{str(e)}\n\n{traceback.format_exc()}",
+                f"Failed to load document:\n{str(e)}",
                 "Error",
                 wx.OK | wx.ICON_ERROR
             )
@@ -892,7 +1202,7 @@ class MainWindow(wx.Frame):
 
         # Phase 2: Compute differences for matched pairs
         progress.Update(0, "Computing differences...")
-        comparator = ImageComparator()
+        comparator = ImageComparator(highlight_color=self._highlight_color)
         matched_pairs = self.matching_result.get_matched_pairs()
         total_pairs = len(matched_pairs)
         self.diff_scores = {}  # Clear previous scores
@@ -921,14 +1231,12 @@ class MainWindow(wx.Frame):
                 # Use has_differences which checks both diff_score and region count
                 self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
 
-                print(f"[DEBUG] Page {left_idx}: diff_score={diff_result.diff_score:.4f}, regions={len(diff_result.regions)}, has_diff={diff_result.has_differences}")
 
                 # Apply highlighted images to thumbnails
                 if diff_result.highlight_image:
                     # Convert PIL Image to wx.Bitmap
                     left_highlight_bitmap = pil_to_wxbitmap(diff_result.highlight_image)
                     self.left_panel.set_diff_result(left_idx, diff_result, left_highlight_bitmap)
-                    print(f"[DEBUG] Left page {left_idx}: highlight applied, bitmap size={left_highlight_bitmap.GetWidth()}x{left_highlight_bitmap.GetHeight()}")
 
                     # Also create highlight for right side (compare right to left)
                     diff_result_right = comparator.compare(
@@ -938,17 +1246,21 @@ class MainWindow(wx.Frame):
                     if diff_result_right.highlight_image:
                         right_highlight_bitmap = pil_to_wxbitmap(diff_result_right.highlight_image)
                         self.right_panel.set_diff_result(right_idx, diff_result_right, right_highlight_bitmap)
-                        print(f"[DEBUG] Right page {right_idx}: highlight applied")
 
         progress.Destroy()
 
         self.session.matching_result = self.matching_result
+        self._current_diff_index = -1  # Reset diff navigation
 
         # Update UI
         self.left_panel.update_match_status(self.matching_result)
         self.right_panel.update_match_status(self.matching_result)
         self._update_status()
         self._update_links()
+
+        # Update diff summary dialog if open
+        if self._diff_summary_dialog and self._diff_summary_dialog.IsShown():
+            self._diff_summary_dialog.update_diff_list(self.matching_result, self.diff_scores)
 
     def _on_page_clicked(self, event: wx.CommandEvent) -> None:
         """Handle page click for manual linking and scroll to paired slide."""
@@ -1096,14 +1408,29 @@ class MainWindow(wx.Frame):
         wx.CallAfter(self._update_links)
 
     def _on_sync_scroll(self, event: wx.CommandEvent) -> None:
-        """Handle sync scrollbar movement."""
+        """Handle sync scrollbar movement - scroll through matched pairs."""
         if not self.left_doc or not self.right_doc:
             return
 
         value = self.sync_scrollbar.GetValue()
-        percent = value / 100.0
 
-        # Scroll both panels to the same percentage
+        # If we have matching results, scroll through matched pairs
+        if self.matching_result:
+            matched_pairs = self.matching_result.get_matched_pairs()
+            if matched_pairs:
+                # Map slider value to pair index
+                pair_idx = int(value / 100.0 * len(matched_pairs))
+                pair_idx = min(pair_idx, len(matched_pairs) - 1)
+
+                left_idx, right_idx, _ = matched_pairs[pair_idx]
+                self.left_panel.scroll_to_page(left_idx)
+                self.right_panel.scroll_to_page(right_idx)
+
+                wx.CallAfter(self._update_links)
+                return
+
+        # Fallback: scroll both panels to the same percentage
+        percent = value / 100.0
         self._scroll_panel_to_percent(self.left_panel, percent)
         self._scroll_panel_to_percent(self.right_panel, percent)
 
@@ -1116,16 +1443,56 @@ class MainWindow(wx.Frame):
             wx.CallAfter(self._update_sync_scrollbar)
 
     def _sync_scroll_from(self, source: DocumentPanel, target: DocumentPanel) -> None:
-        """Sync scroll position from source to target panel."""
-        # Get source scroll position as percentage
-        source_range = source.GetScrollRange(wx.VERTICAL)
-        source_pos = source.GetScrollPos(wx.VERTICAL)
+        """Sync scroll position from source to target panel, trying to align paired slides."""
+        if not self.matching_result:
+            # Fallback to percentage-based sync if no matching
+            source_range = source.GetScrollRange(wx.VERTICAL)
+            source_pos = source.GetScrollPos(wx.VERTICAL)
+            if source_range > 0:
+                percent = source_pos / source_range
+                target_range = target.GetScrollRange(wx.VERTICAL)
+                target_pos = int(percent * target_range)
+                target.Scroll(-1, target_pos)
+            return
 
-        if source_range > 0:
-            percent = source_pos / source_range
-            target_range = target.GetScrollRange(wx.VERTICAL)
-            target_pos = int(percent * target_range)
-            target.Scroll(-1, target_pos)
+        # Find the most visible slide in source panel
+        source_visible_idx = self._get_center_visible_page(source)
+        if source_visible_idx is None:
+            return
+
+        # Find paired slide
+        if source == self.left_panel:
+            match = self.matching_result.get_match_for_left(source_visible_idx)
+            if match and match.right_index is not None:
+                target.scroll_to_page(match.right_index)
+        else:
+            match = self.matching_result.get_match_for_right(source_visible_idx)
+            if match and match.left_index is not None:
+                target.scroll_to_page(match.left_index)
+
+    def _get_center_visible_page(self, panel: DocumentPanel) -> Optional[int]:
+        """Get the page index that's most visible (closest to center) in the panel."""
+        if not panel.thumbnails:
+            return None
+
+        panel_height = panel.GetClientSize().height
+        panel_center_y = panel_height // 2
+
+        # Find which thumbnail is closest to the center
+        best_idx = 0
+        best_distance = float('inf')
+
+        for i, thumb in enumerate(panel.thumbnails):
+            thumb_pos = thumb.GetPosition()
+            thumb_size = thumb.GetSize()
+            thumb_center_y = thumb_pos.y + thumb_size.height // 2
+
+            distance = abs(thumb_center_y - panel_center_y)
+            if distance < best_distance:
+                best_distance = distance
+                best_idx = i
+
+        return best_idx
 
     def _scroll_panel_to_percent(self, panel: DocumentPanel, percent: float) -> None:
         """Scroll panel to a percentage position."""
@@ -1135,11 +1502,24 @@ class MainWindow(wx.Frame):
             panel.Scroll(-1, pos)
 
     def _update_sync_scrollbar(self) -> None:
-        """Update sync scrollbar position based on panel scroll."""
+        """Update sync scrollbar position based on currently visible pair."""
         if not hasattr(self, 'sync_scrollbar'):
             return
 
-        # Use left panel position as reference
+        # If we have matching results, position based on current pair
+        if self.matching_result:
+            matched_pairs = self.matching_result.get_matched_pairs()
+            if matched_pairs:
+                visible_idx = self._get_center_visible_page(self.left_panel)
+                if visible_idx is not None:
+                    # Find which pair contains this index
+                    for i, (left_idx, right_idx, _) in enumerate(matched_pairs):
+                        if left_idx == visible_idx:
+                            percent = int((i / len(matched_pairs)) * 100)
+                            self.sync_scrollbar.SetValue(min(100, max(0, percent)))
+                            return
+
+        # Fallback: use scroll percentage
         scroll_range = self.left_panel.GetScrollRange(wx.VERTICAL)
         scroll_pos = self.left_panel.GetScrollPos(wx.VERTICAL)
 
@@ -1170,6 +1550,138 @@ class MainWindow(wx.Frame):
                 links.append((left_pos, right_pos, match.status, has_diff))
 
         self.link_overlay.set_links(links)
+
+    def _on_close(self, event: wx.CloseEvent) -> None:
+        """Handle window close event."""
+        # Close diff summary dialog if open
+        if self._diff_summary_dialog:
+            self._diff_summary_dialog.Destroy()
+            self._diff_summary_dialog = None
+        event.Skip()
+
+    def _get_diff_pages(self) -> List[tuple]:
+        """Get list of (left_idx, right_idx) for pages with differences."""
+        if not self.matching_result:
+            return []
+        diff_pages = []
+        for match in self.matching_result.matches:
+            if match.status == MatchStatus.MATCHED:
+                has_diff = self.diff_scores.get((match.left_index, match.right_index), False)
+                if has_diff:
+                    diff_pages.append((match.left_index, match.right_index))
+        return diff_pages
+
+    def _go_prev_diff(self, event: wx.Event) -> None:
+        """Navigate to previous page with differences."""
+        diff_pages = self._get_diff_pages()
+        if not diff_pages:
+            self.statusbar.SetStatusText("差分がありません")
+            return
+
+        if self._current_diff_index <= 0:
+            self._current_diff_index = len(diff_pages) - 1
+        else:
+            self._current_diff_index -= 1
+
+        left_idx, right_idx = diff_pages[self._current_diff_index]
+        self.jump_to_page_pair(left_idx, right_idx)
+        self.statusbar.SetStatusText(f"差分 {self._current_diff_index + 1}/{len(diff_pages)}")
+
+    def _go_next_diff(self, event: wx.Event) -> None:
+        """Navigate to next page with differences."""
+        diff_pages = self._get_diff_pages()
+        if not diff_pages:
+            self.statusbar.SetStatusText("差分がありません")
+            return
+
+        if self._current_diff_index >= len(diff_pages) - 1:
+            self._current_diff_index = 0
+        else:
+            self._current_diff_index += 1
+
+        left_idx, right_idx = diff_pages[self._current_diff_index]
+        self.jump_to_page_pair(left_idx, right_idx)
+        self.statusbar.SetStatusText(f"差分 {self._current_diff_index + 1}/{len(diff_pages)}")
+
+    def jump_to_page_pair(self, left_idx: int, right_idx: int) -> None:
+        """Jump to a specific page pair."""
+        self.left_panel.scroll_to_page(left_idx)
+        self.right_panel.scroll_to_page(right_idx)
+        self.left_panel.set_selected(left_idx)
+        self.right_panel.set_selected(right_idx)
+        wx.CallAfter(self._update_links)
+
+    def _show_diff_summary(self, event: wx.Event) -> None:
+        """Show the diff summary dialog."""
+        if self._diff_summary_dialog is None:
+            self._diff_summary_dialog = DiffSummaryDialog(self)
+
+        self._diff_summary_dialog.update_diff_list(self.matching_result, self.diff_scores)
+        self._diff_summary_dialog.Show()
+        self._diff_summary_dialog.Raise()
+
+    def _pick_highlight_color(self, event: wx.Event) -> None:
+        """Open color picker for highlight color."""
+        current = wx.Colour(*self._highlight_color)
+        data = wx.ColourData()
+        data.SetColour(current)
+
+        dialog = wx.ColourDialog(self, data)
+        if dialog.ShowModal() == wx.ID_OK:
+            color = dialog.GetColourData().GetColour()
+            self._highlight_color = (color.Red(), color.Green(), color.Blue())
+            self.statusbar.SetStatusText(f"ハイライト色を変更しました: RGB{self._highlight_color}")
+
+            # Re-run comparison with new color if documents are loaded
+            if self.left_doc and self.right_doc and self.matching_result:
+                self._run_comparison(None)
+
+        dialog.Destroy()
+
+    def _toggle_drawing_mode(self, event: wx.Event) -> None:
+        """Toggle exclusion zone drawing mode."""
+        self._drawing_mode = not self._drawing_mode
+        self.left_panel.set_drawing_mode(self._drawing_mode)
+        self.right_panel.set_drawing_mode(self._drawing_mode)
+
+        if self._drawing_mode:
+            self.statusbar.SetStatusText("除外領域描画モード: 画像上をドラッグして除外領域を指定してください")
+        else:
+            self.statusbar.SetStatusText("除外領域描画モードを終了しました")
+            # Update exclusion zone overlays
+            self._update_exclusion_zone_overlays()
+
+    def on_exclusion_zone_drawn(self, side: str, page_index: int, x: float, y: float, w: float, h: float) -> None:
+        """Handle exclusion zone drawn on a thumbnail."""
+        # Determine applies_to based on side
+        if side == "left":
+            applies_to = AppliesTo.LEFT
+        else:
+            applies_to = AppliesTo.RIGHT
+
+        # Create zone with auto-generated name
+        zone_count = len(self.exclusion_zones.zones) + 1
+        zone = ExclusionZone(
+            x=x, y=y, width=w, height=h,
+            name=f"手動領域 {zone_count}",
+            applies_to=applies_to
+        )
+        self.exclusion_zones.add(zone)
+        self.session.exclusion_zones = self.exclusion_zones
+
+        # Update overlays
+        self._update_exclusion_zone_overlays()
+
+        self.statusbar.SetStatusText(
+            f"除外領域を追加しました: {zone.name} ({x*100:.0f}%, {y*100:.0f}%, {w*100:.0f}%x{h*100:.0f}%)"
+        )
+
+    def _update_exclusion_zone_overlays(self) -> None:
+        """Update exclusion zone overlays on both panels."""
+        left_zones = self.exclusion_zones.get_zones_for("left")
+        right_zones = self.exclusion_zones.get_zones_for("right")
+        self.left_panel.update_exclusion_zones(left_zones)
+        self.right_panel.update_exclusion_zones(right_zones)
 
     def _export_pdf(self, event: wx.Event) -> None:
         """Export comparison report to PDF."""
