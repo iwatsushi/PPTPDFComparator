@@ -47,6 +47,7 @@ class PageThumbnailPanel(wx.Panel):
         self._draw_start: Optional[wx.Point] = None
         self._draw_current: Optional[wx.Point] = None
         self._exclusion_zones: List[tuple] = []  # List of (x, y, w, h) in normalized coords
+        self._selected_zone_index: int = -1  # Index of selected zone
 
         self.SetBackgroundColour(wx.WHITE)
 
@@ -77,6 +78,7 @@ class PageThumbnailPanel(wx.Panel):
         self.image_panel.Bind(wx.EVT_MOTION, self._on_image_motion)
         self.image_panel.Bind(wx.EVT_PAINT, self._on_image_paint)
         self.image_panel.Bind(wx.EVT_LEFT_DCLICK, self._on_double_click)
+        self.image_panel.Bind(wx.EVT_RIGHT_DOWN, self._on_image_right_click)
 
     def set_bitmap(self, bitmap: wx.Bitmap) -> None:
         """Set the thumbnail image."""
@@ -139,13 +141,19 @@ class PageThumbnailPanel(wx.Panel):
         img_h = self._scaled_bitmap.GetHeight()
 
         # Draw existing exclusion zones
-        dc.SetBrush(wx.Brush(wx.Colour(255, 0, 0, 64), wx.BRUSHSTYLE_BDIAGONAL_HATCH))
-        dc.SetPen(wx.Pen(wx.Colour(255, 0, 0), 2, wx.PENSTYLE_DOT))
-        for x, y, w, h in self._exclusion_zones:
+        for i, (x, y, w, h) in enumerate(self._exclusion_zones):
             rect_x = int(x * img_w)
             rect_y = int(y * img_h)
             rect_w = int(w * img_w)
             rect_h = int(h * img_h)
+            if i == self._selected_zone_index:
+                # Selected zone - yellow highlight
+                dc.SetBrush(wx.Brush(wx.Colour(255, 255, 0, 120), wx.BRUSHSTYLE_SOLID))
+                dc.SetPen(wx.Pen(wx.Colour(255, 200, 0), 3, wx.PENSTYLE_SOLID))
+            else:
+                # Normal zone - red
+                dc.SetBrush(wx.Brush(wx.Colour(255, 0, 0, 64), wx.BRUSHSTYLE_BDIAGONAL_HATCH))
+                dc.SetPen(wx.Pen(wx.Colour(255, 0, 0), 2, wx.PENSTYLE_DOT))
             dc.DrawRectangle(rect_x, rect_y, rect_w, rect_h)
 
         # Draw current selection rectangle
@@ -157,6 +165,22 @@ class PageThumbnailPanel(wx.Panel):
             rect = wx.Rect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
             dc.DrawRectangle(rect)
 
+    def _get_zone_at_pos(self, pos: wx.Point) -> int:
+        """Return index of zone at position, or -1 if none."""
+        if not self._scaled_bitmap:
+            return -1
+        img_w = self._scaled_bitmap.GetWidth()
+        img_h = self._scaled_bitmap.GetHeight()
+        px, py = pos.x, pos.y
+        for i, (x, y, w, h) in enumerate(self._exclusion_zones):
+            rx = int(x * img_w)
+            ry = int(y * img_h)
+            rw = int(w * img_w)
+            rh = int(h * img_h)
+            if rx <= px <= rx + rw and ry <= py <= ry + rh:
+                return i
+        return -1
+
     def _on_image_click(self, event: wx.MouseEvent) -> None:
         """Handle click on image panel."""
         if self._drawing_mode:
@@ -164,7 +188,39 @@ class PageThumbnailPanel(wx.Panel):
             self._draw_current = self._draw_start
             self.image_panel.CaptureMouse()
         else:
-            self._on_click(event)
+            # Check if clicking on an exclusion zone
+            pos = event.GetPosition()
+            zone_idx = self._get_zone_at_pos(pos)
+            if zone_idx >= 0:
+                self._selected_zone_index = zone_idx
+                self.image_panel.Refresh()
+            else:
+                self._selected_zone_index = -1
+                self.image_panel.Refresh()
+                self._on_click(event)
+
+    def _on_image_right_click(self, event: wx.MouseEvent) -> None:
+        """Handle right click on image panel - context menu for zones."""
+        pos = event.GetPosition()
+        zone_idx = self._get_zone_at_pos(pos)
+        if zone_idx >= 0:
+            self._selected_zone_index = zone_idx
+            self.image_panel.Refresh()
+            # Show context menu
+            menu = wx.Menu()
+            delete_item = menu.Append(wx.ID_ANY, "この除外領域を削除")
+            self.Bind(wx.EVT_MENU, lambda e: self._notify_zone_delete(zone_idx), delete_item)
+            self.PopupMenu(menu)
+            menu.Destroy()
+
+    def _notify_zone_delete(self, zone_idx: int) -> None:
+        """Notify parent to delete a zone."""
+        parent = self.GetParent()
+        while parent:
+            if hasattr(parent, 'on_exclusion_zone_delete'):
+                parent.on_exclusion_zone_delete(zone_idx)
+                return
+            parent = parent.GetParent()
 
     def _on_image_release(self, event: wx.MouseEvent) -> None:
         """Handle mouse release on image panel."""
@@ -530,9 +586,10 @@ class FileDropTarget(wx.FileDropTarget):
             return False
 
         if len(valid_files) >= 2:
-            # Two or more files: load first to left, second to right
+            # Two or more files: load first to left, second to right with deferred load
             frame.on_file_dropped(valid_files[0], "left")
-            frame.on_file_dropped(valid_files[1], "right")
+            # Defer second document load to allow UI to update
+            wx.CallLater(100, frame.on_file_dropped, valid_files[1], "right")
         else:
             # Single file: load to this panel's side
             frame.on_file_dropped(valid_files[0], self.panel.side)
@@ -1070,6 +1127,10 @@ class MainWindow(wx.Frame):
             wx.ArtProvider.GetBitmap(wx.ART_CUT),
             shortHelp="除外領域描画モード"
         )
+
+        # Remove zone buttons
+        remove_zone_btn = toolbar.AddTool(wx.ID_ANY, "Remove Zone", wx.ArtProvider.GetBitmap(wx.ART_DELETE), shortHelp="最後の除外領域を削除")
+        clear_zones_btn = toolbar.AddTool(wx.ID_ANY, "Clear Zones", wx.ArtProvider.GetBitmap(wx.ART_CROSS_MARK), shortHelp="全ての除外領域を削除")
         toolbar.AddSeparator()
 
         export_pdf_btn = toolbar.AddTool(wx.ID_ANY, "Export PDF", wx.ArtProvider.GetBitmap(wx.ART_FILE_SAVE))
@@ -1083,6 +1144,8 @@ class MainWindow(wx.Frame):
         self.Bind(wx.EVT_TOOL, self._show_diff_summary, diff_summary_btn)
         self.Bind(wx.EVT_TOOL, self._pick_highlight_color, color_btn)
         self.Bind(wx.EVT_TOOL, self._toggle_drawing_mode, self._draw_mode_btn)
+        self.Bind(wx.EVT_TOOL, self._remove_last_exclusion_zone, remove_zone_btn)
+        self.Bind(wx.EVT_TOOL, self._clear_all_exclusion_zones, clear_zones_btn)
         self.Bind(wx.EVT_TOOL, self._export_pdf, export_pdf_btn)
         self.Bind(wx.EVT_TOOL, self._export_html, export_html_btn)
 
@@ -1675,6 +1738,44 @@ class MainWindow(wx.Frame):
             f"除外領域を追加しました: {zone.name} ({x*100:.0f}%, {y*100:.0f}%, {w*100:.0f}%x{h*100:.0f}%)"
         )
 
+        # Auto re-compare in background
+        if self.left_doc and self.right_doc:
+            wx.CallLater(100, self._run_comparison, None)
+
+    def on_exclusion_zone_delete(self, zone_index: int) -> None:
+        """Handle exclusion zone delete request."""
+        if 0 <= zone_index < len(self.exclusion_zones.zones):
+            removed = self.exclusion_zones.zones.pop(zone_index)
+            self.session.exclusion_zones = self.exclusion_zones
+            self._update_exclusion_zone_overlays()
+            self.statusbar.SetStatusText(f"除外領域を削除しました: {removed.name}")
+            # Auto re-compare
+            if self.left_doc and self.right_doc:
+                wx.CallLater(100, self._run_comparison, None)
+
+    def _remove_last_exclusion_zone(self, event: wx.Event) -> None:
+        """Remove the most recently added exclusion zone."""
+        if self.exclusion_zones.zones:
+            removed = self.exclusion_zones.zones.pop()
+            self.session.exclusion_zones = self.exclusion_zones
+            self._update_exclusion_zone_overlays()
+            self.statusbar.SetStatusText(f"除外領域を削除しました: {removed.name}")
+            # Auto re-compare
+            if self.left_doc and self.right_doc:
+                wx.CallLater(100, self._run_comparison, None)
+
+    def _clear_all_exclusion_zones(self, event: wx.Event) -> None:
+        """Clear all exclusion zones."""
+        if self.exclusion_zones.zones:
+            count = len(self.exclusion_zones.zones)
+            self.exclusion_zones.zones.clear()
+            self.session.exclusion_zones = self.exclusion_zones
+            self._update_exclusion_zone_overlays()
+            self.statusbar.SetStatusText(f"全ての除外領域を削除しました ({count} 領域)")
+            # Auto re-compare
+            if self.left_doc and self.right_doc:
+                wx.CallLater(100, self._run_comparison, None)
+
     def _update_exclusion_zone_overlays(self) -> None:
         """Update exclusion zone overlays on both panels."""
         left_zones = self.exclusion_zones.get_zones_for("left")
@@ -1715,7 +1816,8 @@ class MainDropTarget(wx.FileDropTarget):
 
         if len(valid_files) >= 2:
             self.frame._load_document(valid_files[0], "left")
-            self.frame._load_document(valid_files[1], "right")
+            # Defer second document load to allow UI to update
+            wx.CallLater(100, self.frame._load_document, valid_files[1], "right")
         elif len(valid_files) == 1:
             if self.frame.left_doc is None:
                 self.frame._load_document(valid_files[0], "left")

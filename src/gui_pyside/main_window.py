@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, List
 import sys
 
-from PySide6.QtCore import Qt, Signal, QMimeData, QPoint, QRectF, QTimer
+from PySide6.QtCore import Qt, Signal, QMimeData, QPoint, QRectF, QTimer, QEvent, QThread, QObject
 from PySide6.QtGui import (
     QAction, QPainter, QPen, QColor, QBrush,
     QDragEnterEvent, QDropEvent, QPixmap, QFont,
@@ -41,19 +41,96 @@ except ImportError:
     from utils.image_utils import pil_to_qpixmap
 
 
+class ImageLabel(QLabel):
+    """Custom QLabel that draws exclusion zone overlays."""
+
+    zone_clicked = Signal(int)  # Index of clicked zone
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._exclusion_zones: List[tuple] = []
+        self._draw_start: Optional[QPoint] = None
+        self._draw_current: Optional[QPoint] = None
+        self._drawing_mode: bool = False
+        self._selected_zone: int = -1  # Index of selected zone
+
+    def set_exclusion_zones(self, zones: List[tuple]) -> None:
+        self._exclusion_zones = zones
+        self._selected_zone = -1
+        self.update()
+
+    def set_drawing_state(self, start, current, mode: bool) -> None:
+        self._draw_start = start
+        self._draw_current = current
+        self._drawing_mode = mode
+        self.update()
+
+    def set_selected_zone(self, index: int) -> None:
+        self._selected_zone = index
+        self.update()
+
+    def get_zone_at_pos(self, pos: QPoint) -> int:
+        """Return index of zone at position, or -1 if none."""
+        pixmap = self.pixmap()
+        if not pixmap:
+            return -1
+        img_w, img_h = pixmap.width(), pixmap.height()
+        offset_x = (self.width() - img_w) // 2
+        offset_y = (self.height() - img_h) // 2
+        px, py = pos.x(), pos.y()
+        for i, (x, y, w, h) in enumerate(self._exclusion_zones):
+            rx = offset_x + int(x * img_w)
+            ry = offset_y + int(y * img_h)
+            rw = int(w * img_w)
+            rh = int(h * img_h)
+            if rx <= px <= rx + rw and ry <= py <= ry + rh:
+                return i
+        return -1
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        pixmap = self.pixmap()
+        if not pixmap:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        img_w, img_h = pixmap.width(), pixmap.height()
+        offset_x = (self.width() - img_w) // 2
+        offset_y = (self.height() - img_h) // 2
+        # Draw exclusion zones
+        for i, (x, y, w, h) in enumerate(self._exclusion_zones):
+            rx = offset_x + int(x * img_w)
+            ry = offset_y + int(y * img_h)
+            rw = int(w * img_w)
+            rh = int(h * img_h)
+            if i == self._selected_zone:
+                # Selected zone - yellow highlight
+                painter.setBrush(QBrush(QColor(255, 255, 0, 120)))
+                painter.setPen(QPen(QColor(255, 200, 0), 3, Qt.PenStyle.SolidLine))
+            else:
+                # Normal zone - red
+                painter.setBrush(QBrush(QColor(255, 0, 0, 80)))
+                painter.setPen(QPen(QColor(255, 0, 0), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(rx, ry, rw, rh)
+        # Draw rubber band
+        if self._drawing_mode and self._draw_start and self._draw_current:
+            painter.setBrush(QBrush(QColor(0, 120, 215, 50)))
+            painter.setPen(QPen(QColor(0, 120, 215), 2))
+            x1, y1 = self._draw_start.x(), self._draw_start.y()
+            x2, y2 = self._draw_current.x(), self._draw_current.y()
+            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+        painter.end()
+
+
 class PageThumbnail(QFrame):
     """Widget displaying a single page thumbnail."""
 
-    clicked = Signal(int, str)  # page_index, side ("left" or "right")
+    clicked = Signal(int, str)
     double_clicked = Signal(int, str)
-    exclusion_zone_drawn = Signal(str, int, float, float, float, float)  # side, page_idx, x, y, w, h
+    exclusion_zone_drawn = Signal(str, int, float, float, float, float)
+    exclusion_zone_delete_requested = Signal(int)  # zone index to delete
 
-    def __init__(
-        self,
-        page_index: int,
-        side: str,
-        parent: Optional[QWidget] = None
-    ):
+    def __init__(self, page_index: int, side: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.page_index = page_index
         self.side = side
@@ -63,12 +140,11 @@ class PageThumbnail(QFrame):
         self._selected = False
         self._match_status: Optional[MatchStatus] = None
         self._diff_result: Optional[DiffResult] = None
-
-        # Exclusion zone drawing state
         self._drawing_mode: bool = False
         self._draw_start: Optional[QPoint] = None
         self._draw_current: Optional[QPoint] = None
-        self._exclusion_zones: List[tuple] = []  # List of (x, y, w, h) in normalized coords
+        self._exclusion_zones: List[tuple] = []
+        self._selected_zone_index: int = -1
 
         self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
         self.setLineWidth(2)
@@ -76,13 +152,10 @@ class PageThumbnail(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        self.image_label = QLabel()
+        self.image_label = ImageLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setSizePolicy(
-            self.image_label.sizePolicy().horizontalPolicy(),
-            self.image_label.sizePolicy().verticalPolicy()
-        )
         self.image_label.setMouseTracking(True)
+        self.image_label.installEventFilter(self)
 
         self.page_label = QLabel(f"Page {page_index + 1}")
         self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -99,18 +172,88 @@ class PageThumbnail(QFrame):
     def set_drawing_mode(self, enabled: bool) -> None:
         """Enable or disable exclusion zone drawing mode."""
         self._drawing_mode = enabled
-        if enabled:
-            self.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+        cursor = Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor
+        self.setCursor(cursor)
+        self.image_label.setCursor(cursor)
         self._draw_start = None
         self._draw_current = None
-        self.update()
+        self.image_label.set_drawing_state(None, None, enabled)
 
     def set_exclusion_zones(self, zones: List[tuple]) -> None:
         """Set exclusion zones to display as overlays."""
         self._exclusion_zones = zones
-        self.update()
+        self.image_label.set_exclusion_zones(zones)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Filter mouse events from image_label for drawing and zone selection."""
+        if obj == self.image_label:
+            if self._drawing_mode:
+                # Drawing mode - handle drawing
+                if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                    self._draw_start = event.position().toPoint()
+                    self._draw_current = self._draw_start
+                    self.image_label.set_drawing_state(self._draw_start, self._draw_current, True)
+                    return True
+                elif event.type() == QEvent.Type.MouseMove and self._draw_start:
+                    self._draw_current = event.position().toPoint()
+                    self.image_label.set_drawing_state(self._draw_start, self._draw_current, True)
+                    return True
+                elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton and self._draw_start:
+                    self._draw_current = event.position().toPoint()
+                    self._finish_drawing()
+                    return True
+            else:
+                # Selection mode - click to select zone, right-click for context menu
+                if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                    pos = event.position().toPoint()
+                    zone_idx = self.image_label.get_zone_at_pos(pos)
+                    if zone_idx >= 0:
+                        self.image_label.set_selected_zone(zone_idx)
+                        self._selected_zone_index = zone_idx
+                        return True
+                    else:
+                        self.image_label.set_selected_zone(-1)
+                        self._selected_zone_index = -1
+                elif event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
+                    pos = event.position().toPoint()
+                    zone_idx = self.image_label.get_zone_at_pos(pos)
+                    if zone_idx >= 0:
+                        self._show_zone_context_menu(event.globalPosition().toPoint(), zone_idx)
+                        return True
+        return super().eventFilter(obj, event)
+
+    def _show_zone_context_menu(self, global_pos: QPoint, zone_idx: int) -> None:
+        """Show context menu for exclusion zone."""
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        delete_action = menu.addAction("この除外領域を削除")
+        action = menu.exec(global_pos)
+        if action == delete_action:
+            self.exclusion_zone_delete_requested.emit(zone_idx)
+
+    def _finish_drawing(self) -> None:
+        """Complete drawing and emit signal."""
+        if not self._draw_start or not self._draw_current:
+            return
+        pixmap = self.image_label.pixmap()
+        if pixmap:
+            img_w, img_h = pixmap.width(), pixmap.height()
+            offset_x = (self.image_label.width() - img_w) // 2
+            offset_y = (self.image_label.height() - img_h) // 2
+            x1 = self._draw_start.x() - offset_x
+            y1 = self._draw_start.y() - offset_y
+            x2 = self._draw_current.x() - offset_x
+            y2 = self._draw_current.y() - offset_y
+            if img_w > 0 and img_h > 0:
+                nx = max(0, min(1, min(x1, x2) / img_w))
+                ny = max(0, min(1, min(y1, y2) / img_h))
+                nw = max(0, min(1 - nx, abs(x2 - x1) / img_w))
+                nh = max(0, min(1 - ny, abs(y2 - y1) / img_h))
+                if nw > 0.01 and nh > 0.01:
+                    self.exclusion_zone_drawn.emit(self.side, self.page_index, nx, ny, nw, nh)
+        self._draw_start = None
+        self._draw_current = None
+        self.image_label.set_drawing_state(None, None, self._drawing_mode)
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         """Set the thumbnail image."""
@@ -312,6 +455,7 @@ class DocumentPanel(QScrollArea):
     page_double_clicked = Signal(int, str)
     file_dropped = Signal(str)
     exclusion_zone_drawn = Signal(str, int, float, float, float, float)  # side, page_idx, x, y, w, h
+    exclusion_zone_delete_requested = Signal(int)  # zone index to delete
 
     def __init__(self, side: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -440,6 +584,7 @@ class DocumentPanel(QScrollArea):
             thumb.clicked.connect(self._on_page_clicked)
             thumb.double_clicked.connect(self._on_page_double_clicked)
             thumb.exclusion_zone_drawn.connect(self._on_exclusion_zone_drawn)
+            thumb.exclusion_zone_delete_requested.connect(self._on_exclusion_zone_delete)
 
             if page.thumbnail:
                 pixmap = pil_to_qpixmap(page.thumbnail)
@@ -451,6 +596,10 @@ class DocumentPanel(QScrollArea):
     def _on_exclusion_zone_drawn(self, side: str, page_index: int, x: float, y: float, w: float, h: float) -> None:
         """Forward exclusion zone signal to parent."""
         self.exclusion_zone_drawn.emit(side, page_index, x, y, w, h)
+
+    def _on_exclusion_zone_delete(self, zone_index: int) -> None:
+        """Forward exclusion zone delete signal to parent."""
+        self.exclusion_zone_delete_requested.emit(zone_index)
 
     def _on_page_clicked(self, index: int, side: str):
         """Handle page click."""
@@ -552,14 +701,12 @@ class DocumentPanel(QScrollArea):
                 valid_files.append(path)
 
         if len(valid_files) >= 2:
-            # Two files: emit for both left and right
-            # Use parent window to load both
+            # Two files: load with deferred second load to prevent freeze
             window = self.window()
             if hasattr(window, '_load_document'):
                 window._load_document(valid_files[0], "left")
-                window._load_document(valid_files[1], "right")
+                QTimer.singleShot(100, lambda: window._load_document(valid_files[1], "right"))
         elif len(valid_files) == 1:
-            # Single file: emit for this panel's side
             self.file_dropped.emit(valid_files[0])
 
         event.acceptProposedAction()
@@ -955,6 +1102,8 @@ class MainWindow(QMainWindow):
         # Connect exclusion zone signals
         self.left_panel.exclusion_zone_drawn.connect(self._on_exclusion_zone_drawn)
         self.right_panel.exclusion_zone_drawn.connect(self._on_exclusion_zone_drawn)
+        self.left_panel.exclusion_zone_delete_requested.connect(self._delete_exclusion_zone)
+        self.right_panel.exclusion_zone_delete_requested.connect(self._delete_exclusion_zone)
 
         self.splitter.addWidget(self.left_panel)
         self.splitter.addWidget(self.right_panel)
@@ -1251,6 +1400,17 @@ class MainWindow(QMainWindow):
         self._draw_mode_action.setCheckable(True)
         self._draw_mode_action.triggered.connect(self._toggle_drawing_mode)
         toolbar.addAction(self._draw_mode_action)
+
+        # Remove last zone button
+        remove_zone_btn = QAction("除外領域削除", self)
+        remove_zone_btn.setShortcut("Ctrl+Z")
+        remove_zone_btn.triggered.connect(self._remove_last_exclusion_zone)
+        toolbar.addAction(remove_zone_btn)
+
+        # Clear all zones button
+        clear_zones_btn = QAction("全削除", self)
+        clear_zones_btn.triggered.connect(self._clear_all_exclusion_zones)
+        toolbar.addAction(clear_zones_btn)
 
         toolbar.addSeparator()
 
@@ -1608,6 +1768,51 @@ class MainWindow(QMainWindow):
             f"除外領域を追加しました: {zone.name} ({x*100:.0f}%, {y*100:.0f}%, {w*100:.0f}%x{h*100:.0f}%)"
         )
 
+        # Auto re-compare in background
+        if self.left_doc and self.right_doc:
+            QTimer.singleShot(100, self._run_comparison_background)
+
+    def _run_comparison_background(self) -> None:
+        """Run comparison in a non-blocking way."""
+        if not self.left_doc or not self.right_doc:
+            return
+        # Run comparison (this already has progress dialog which allows events)
+        self._run_comparison()
+
+    def _remove_last_exclusion_zone(self) -> None:
+        """Remove the most recently added exclusion zone."""
+        if self.exclusion_zones.zones:
+            removed = self.exclusion_zones.zones.pop()
+            self.session.exclusion_zones = self.exclusion_zones
+            self._update_exclusion_zone_overlays()
+            self.statusbar.showMessage(f"除外領域を削除しました: {removed.name}")
+            # Auto re-compare
+            if self.left_doc and self.right_doc:
+                QTimer.singleShot(100, self._run_comparison_background)
+
+    def _clear_all_exclusion_zones(self) -> None:
+        """Clear all exclusion zones."""
+        if self.exclusion_zones.zones:
+            count = len(self.exclusion_zones.zones)
+            self.exclusion_zones.zones.clear()
+            self.session.exclusion_zones = self.exclusion_zones
+            self._update_exclusion_zone_overlays()
+            self.statusbar.showMessage(f"全ての除外領域を削除しました ({count} 領域)")
+            # Auto re-compare
+            if self.left_doc and self.right_doc:
+                QTimer.singleShot(100, self._run_comparison_background)
+
+    def _delete_exclusion_zone(self, zone_index: int) -> None:
+        """Delete a specific exclusion zone by index."""
+        if 0 <= zone_index < len(self.exclusion_zones.zones):
+            removed = self.exclusion_zones.zones.pop(zone_index)
+            self.session.exclusion_zones = self.exclusion_zones
+            self._update_exclusion_zone_overlays()
+            self.statusbar.showMessage(f"除外領域を削除しました: {removed.name}")
+            # Auto re-compare
+            if self.left_doc and self.right_doc:
+                QTimer.singleShot(100, self._run_comparison_background)
+
     def _update_exclusion_zone_overlays(self) -> None:
         """Update exclusion zone overlays on both panels."""
         left_zones = self.exclusion_zones.get_zones_for("left")
@@ -1720,9 +1925,9 @@ class MainWindow(QMainWindow):
                 valid_files.append(path)
 
         if len(valid_files) >= 2:
-            # Two files dropped - load as left and right
+            # Two files dropped - load with deferred second load to prevent freeze
             self._load_document(valid_files[0], "left")
-            self._load_document(valid_files[1], "right")
+            QTimer.singleShot(100, lambda: self._load_document(valid_files[1], "right"))
         elif len(valid_files) == 1:
             # Single file - load to empty side or left
             if self.left_doc is None:
