@@ -151,18 +151,12 @@ class PageThumbnail(QFrame):
                     border: 3px solid #004085;
                 }
             """)
-        elif self._match_status == MatchStatus.UNMATCHED_LEFT:
+        elif self._match_status == MatchStatus.UNMATCHED_LEFT or self._match_status == MatchStatus.UNMATCHED_RIGHT:
+            # Orange border for unmatched slides (only on one side)
             self.setStyleSheet("""
                 PageThumbnail {
-                    background-color: #fff3cd;
-                    border: 2px solid #856404;
-                }
-            """)
-        elif self._match_status == MatchStatus.UNMATCHED_RIGHT:
-            self.setStyleSheet("""
-                PageThumbnail {
-                    background-color: #d4edda;
-                    border: 2px solid #155724;
+                    background-color: #ffe0b2;
+                    border: 3px solid #ff9800;
                 }
             """)
         else:
@@ -442,18 +436,17 @@ class LinkOverlay(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        for left_pos, right_pos, status, similarity in self.links:
+        for left_pos, right_pos, status, diff_score in self.links:
             if left_pos is None or right_pos is None:
                 continue
 
-            # Choose color based on status and similarity
+            # Choose color based on diff_score
+            # diff_score: 0.0 = identical, higher = more different
             if status == MatchStatus.MATCHED:
-                if similarity >= 0.95:
-                    color = QColor(40, 167, 69)  # Green - very similar
-                elif similarity >= 0.8:
-                    color = QColor(255, 193, 7)  # Yellow - some differences
+                if diff_score < 0.01:
+                    color = QColor(40, 167, 69)  # Green - no difference
                 else:
-                    color = QColor(220, 53, 69)  # Red - significant differences
+                    color = QColor(220, 53, 69)  # Red - has differences
             else:
                 color = QColor(108, 117, 125)  # Gray - unmatched
 
@@ -481,6 +474,7 @@ class MainWindow(QMainWindow):
         self.right_doc: Optional[Document] = None
         self.matching_result: Optional[MatchingResult] = None
         self.exclusion_zones = ExclusionZoneSet()
+        self.diff_scores: dict = {}  # (left_idx, right_idx) -> diff_score
 
         self._selected_left: Optional[int] = None
         self._selected_right: Optional[int] = None
@@ -828,6 +822,7 @@ class MainWindow(QMainWindow):
         comparator = ImageComparator()
         matched_pairs = self.matching_result.get_matched_pairs()
         total_pairs = len(matched_pairs)
+        self.diff_scores = {}  # Clear previous scores
 
         for i, (left_idx, right_idx, score) in enumerate(matched_pairs):
             progress.setValue(int((i + 1) / total_pairs * 100) if total_pairs > 0 else 100)
@@ -843,6 +838,9 @@ class MainWindow(QMainWindow):
                     left_page.thumbnail, right_page.thumbnail,
                     exclusion_zones=self.exclusion_zones.get_zones_for("left")
                 )
+
+                # Store diff_score for link coloring
+                self.diff_scores[(left_idx, right_idx)] = diff_result.diff_score
 
                 # Apply highlighted images to thumbnails
                 if diff_result.highlight_image:
@@ -926,7 +924,9 @@ class MainWindow(QMainWindow):
                 left_pos = self.left_panel.get_thumbnail_position(match.left_index)
                 right_pos = self.right_panel.get_thumbnail_position(match.right_index)
                 if left_pos and right_pos:
-                    links.append((left_pos, right_pos, match.status, match.similarity))
+                    # Use diff_score for coloring instead of similarity
+                    diff_score = self.diff_scores.get((match.left_index, match.right_index), 0.0)
+                    links.append((left_pos, right_pos, match.status, diff_score))
 
         self.link_overlay.set_links(links)
         self.link_overlay.setGeometry(self.centralWidget().rect())

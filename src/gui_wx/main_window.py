@@ -154,10 +154,9 @@ class PageThumbnailPanel(wx.Panel):
         """Update visual style based on state."""
         if self._selected:
             self.SetBackgroundColour(wx.Colour(204, 229, 255))  # Light blue
-        elif self._match_status == MatchStatus.UNMATCHED_LEFT:
-            self.SetBackgroundColour(wx.Colour(255, 243, 205))  # Light yellow
-        elif self._match_status == MatchStatus.UNMATCHED_RIGHT:
-            self.SetBackgroundColour(wx.Colour(212, 237, 218))  # Light green
+        elif self._match_status == MatchStatus.UNMATCHED_LEFT or self._match_status == MatchStatus.UNMATCHED_RIGHT:
+            # Orange background for unmatched slides (only on one side)
+            self.SetBackgroundColour(wx.Colour(255, 224, 178))  # Light orange
         else:
             self.SetBackgroundColour(wx.WHITE)
         self.Refresh()
@@ -432,14 +431,14 @@ class LinkOverlayPanel(wx.Panel):
             left_x = 0  # Left edge
             right_x = panel_width  # Right edge
 
-            # Choose color based on status and similarity
+            # Choose color based on diff_score
+            # similarity is now actually diff_score (0.0 = identical, higher = more different)
+            diff_score = similarity
             if status == MatchStatus.MATCHED:
-                if similarity >= 0.95:
-                    color = wx.Colour(40, 167, 69)  # Green
-                elif similarity >= 0.8:
-                    color = wx.Colour(255, 193, 7)  # Yellow
+                if diff_score < 0.01:
+                    color = wx.Colour(40, 167, 69)  # Green - no difference
                 else:
-                    color = wx.Colour(220, 53, 69)  # Red
+                    color = wx.Colour(220, 53, 69)  # Red - has differences
             else:
                 color = wx.Colour(108, 117, 125)  # Gray
 
@@ -608,6 +607,7 @@ class MainWindow(wx.Frame):
         self.right_doc: Optional[Document] = None
         self.matching_result: Optional[MatchingResult] = None
         self.exclusion_zones = ExclusionZoneSet()
+        self.diff_scores: dict = {}  # (left_idx, right_idx) -> diff_score
 
         self._selected_left: Optional[int] = None
         self._selected_right: Optional[int] = None
@@ -874,6 +874,7 @@ class MainWindow(wx.Frame):
         comparator = ImageComparator()
         matched_pairs = self.matching_result.get_matched_pairs()
         total_pairs = len(matched_pairs)
+        self.diff_scores = {}  # Clear previous scores
 
         for i, (left_idx, right_idx, score) in enumerate(matched_pairs):
             progress.Update(int((i + 1) / total_pairs * 100) if total_pairs > 0 else 100,
@@ -894,6 +895,9 @@ class MainWindow(wx.Frame):
                     left_page.thumbnail, right_page.thumbnail,
                     exclusion_zones=left_zones
                 )
+
+                # Store diff_score for link coloring
+                self.diff_scores[(left_idx, right_idx)] = diff_result.diff_score
 
                 print(f"[DEBUG] Page {left_idx}: diff_score={diff_result.diff_score:.4f}, regions={len(diff_result.regions)}")
 
@@ -1120,7 +1124,9 @@ class MainWindow(wx.Frame):
             right_pos = self.right_panel.get_thumbnail_position(match.right_index)
 
             if left_pos and right_pos:
-                links.append((left_pos, right_pos, match.status, match.similarity))
+                # Use diff_score for coloring (passed as 4th element instead of similarity)
+                diff_score = self.diff_scores.get((match.left_index, match.right_index), 0.0)
+                links.append((left_pos, right_pos, match.status, diff_score))
 
         self.link_overlay.set_links(links)
 
