@@ -353,6 +353,29 @@ class DocumentPanel(scrolled.ScrolledPanel):
         if page_index < len(self.thumbnails):
             self.thumbnails[page_index].set_diff_result(diff_result, highlight_bitmap)
 
+    def scroll_to_page(self, page_index: int) -> None:
+        """Scroll to make a specific page visible."""
+        if page_index < 0 or page_index >= len(self.thumbnails):
+            return
+
+        thumb = self.thumbnails[page_index]
+        # Get thumbnail position relative to the scrolled panel
+        thumb_pos = thumb.GetPosition()
+        thumb_size = thumb.GetSize()
+
+        # Get scroll unit and current position
+        scroll_unit = self.GetScrollPixelsPerUnit()[1]
+        if scroll_unit == 0:
+            scroll_unit = 10
+
+        # Calculate target scroll position (center the thumbnail if possible)
+        panel_height = self.GetClientSize().height
+        target_y = thumb_pos.y - (panel_height // 2) + (thumb_size.height // 2)
+        target_y = max(0, target_y)
+
+        # Scroll to position
+        self.Scroll(-1, target_y // scroll_unit)
+
 
 class FileDropTarget(wx.FileDropTarget):
     """Drop target for document files."""
@@ -414,7 +437,7 @@ class LinkOverlayPanel(wx.Panel):
         panel_width = self.GetSize().width
         panel_height = self.GetSize().height
 
-        for left_pos, right_pos, status, similarity in self.links:
+        for left_pos, right_pos, status, has_diff in self.links:
             if left_pos is None or right_pos is None:
                 continue
 
@@ -431,14 +454,12 @@ class LinkOverlayPanel(wx.Panel):
             left_x = 0  # Left edge
             right_x = panel_width  # Right edge
 
-            # Choose color based on diff_score
-            # similarity is now actually diff_score (0.0 = identical, higher = more different)
-            diff_score = similarity
+            # Choose color based on has_diff (True = has differences, False = identical)
             if status == MatchStatus.MATCHED:
-                if diff_score < 0.01:
-                    color = wx.Colour(40, 167, 69)  # Green - no difference
-                else:
+                if has_diff:
                     color = wx.Colour(220, 53, 69)  # Red - has differences
+                else:
+                    color = wx.Colour(40, 167, 69)  # Green - no difference
             else:
                 color = wx.Colour(108, 117, 125)  # Gray
 
@@ -896,10 +917,11 @@ class MainWindow(wx.Frame):
                     exclusion_zones=left_zones
                 )
 
-                # Store diff_score for link coloring
-                self.diff_scores[(left_idx, right_idx)] = diff_result.diff_score
+                # Store whether there are differences (for link coloring)
+                # Use has_differences which checks both diff_score and region count
+                self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
 
-                print(f"[DEBUG] Page {left_idx}: diff_score={diff_result.diff_score:.4f}, regions={len(diff_result.regions)}")
+                print(f"[DEBUG] Page {left_idx}: diff_score={diff_result.diff_score:.4f}, regions={len(diff_result.regions)}, has_diff={diff_result.has_differences}")
 
                 # Apply highlighted images to thumbnails
                 if diff_result.highlight_image:
@@ -929,16 +951,20 @@ class MainWindow(wx.Frame):
         self._update_links()
 
     def _on_page_clicked(self, event: wx.CommandEvent) -> None:
-        """Handle page click for manual linking."""
+        """Handle page click for manual linking and scroll to paired slide."""
         index = event.GetInt()
         side = event.GetString()
 
         if side == "left":
             self._selected_left = index
             self.left_panel.set_selected(index)
+            # Scroll to paired slide on the right
+            self._scroll_to_paired_slide(index, "left")
         else:
             self._selected_right = index
             self.right_panel.set_selected(index)
+            # Scroll to paired slide on the left
+            self._scroll_to_paired_slide(index, "right")
 
         # If both selected, create manual link
         if self._selected_left is not None and self._selected_right is not None:
@@ -947,6 +973,21 @@ class MainWindow(wx.Frame):
             self._selected_right = None
             self.left_panel.set_selected(None)
             self.right_panel.set_selected(None)
+
+    def _scroll_to_paired_slide(self, clicked_index: int, clicked_side: str) -> None:
+        """Scroll the opposite panel to show the paired slide."""
+        if not self.matching_result:
+            return
+
+        # Find the matched page
+        if clicked_side == "left":
+            match = self.matching_result.get_match_for_left(clicked_index)
+            if match and match.right_index is not None:
+                self.right_panel.scroll_to_page(match.right_index)
+        else:
+            match = self.matching_result.get_match_for_right(clicked_index)
+            if match and match.left_index is not None:
+                self.left_panel.scroll_to_page(match.left_index)
 
     def _create_manual_link(self, left_index: int, right_index: int) -> None:
         """Create a manual link between pages."""
@@ -1124,9 +1165,9 @@ class MainWindow(wx.Frame):
             right_pos = self.right_panel.get_thumbnail_position(match.right_index)
 
             if left_pos and right_pos:
-                # Use diff_score for coloring (passed as 4th element instead of similarity)
-                diff_score = self.diff_scores.get((match.left_index, match.right_index), 0.0)
-                links.append((left_pos, right_pos, match.status, diff_score))
+                # Use has_differences for coloring (True = red, False = green)
+                has_diff = self.diff_scores.get((match.left_index, match.right_index), False)
+                links.append((left_pos, right_pos, match.status, has_diff))
 
         self.link_overlay.set_links(links)
 
