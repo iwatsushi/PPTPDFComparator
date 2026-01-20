@@ -215,6 +215,7 @@ class Document:
             raise RuntimeError("PowerPoint COM is only available on Windows")
 
         try:
+            import comtypes
             import comtypes.client
         except ImportError:
             raise RuntimeError("comtypes not installed. Run: pip install comtypes")
@@ -223,7 +224,7 @@ class Document:
         presentation = None
         try:
             # Initialize COM
-            comtypes.client.CoInitialize()
+            comtypes.CoInitialize()
             powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
             powerpoint.Visible = 1  # Must be visible for export
 
@@ -247,7 +248,49 @@ class Document:
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir_path = Path(tmpdir)
 
-                # Export each slide as PNG
+                # Method 1: Try exporting all slides at once using SaveAs
+                # This often works better than individual slide export
+                export_folder = tmpdir_path / "slides"
+                export_folder.mkdir(exist_ok=True)
+
+                try:
+                    # Export all slides as PNG using SaveAs (ppSaveAsPNG = 18)
+                    export_path = str(export_folder / "slide.png")
+                    presentation.SaveAs(export_path, 18)  # 18 = ppSaveAsPNG
+                    time.sleep(1)
+
+                    # PowerPoint creates files in a subfolder with slide names
+                    # Find all PNG files recursively
+                    png_files = []
+                    for pattern in ["**/*.PNG", "**/*.png"]:
+                        png_files.extend(export_folder.glob(pattern))
+
+                    # Sort by filename to get correct order (slide1, slide2, etc.)
+                    # Extract number from filename for proper sorting
+                    def extract_number(path):
+                        import re
+                        match = re.search(r'(\d+)', path.stem)
+                        return int(match.group(1)) if match else 0
+
+                    png_files = sorted(set(png_files), key=extract_number)
+
+                    if png_files and len(png_files) >= total:
+                        for i, png_file in enumerate(png_files[:total]):
+                            if progress_callback:
+                                progress_callback(i + 1, total)
+
+                            img = Image.open(png_file)
+                            thumbnail = img.copy()
+                            thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
+
+                            page = Page(index=i, thumbnail=thumbnail)
+                            page.compute_phash()
+                            self.pages.append(page)
+                        return  # Success with SaveAs method
+                except Exception:
+                    pass  # Fall through to individual export method
+
+                # Method 2: Export slides individually (fallback)
                 for i in range(1, total + 1):
                     if progress_callback:
                         progress_callback(i, total)
@@ -255,21 +298,22 @@ class Document:
                     slide = presentation.Slides(i)
                     img_path = tmpdir_path / f"slide_{i}.png"
 
-                    # Export slide as image (width based on DPI)
-                    # PowerPoint default is 96 DPI, we want higher
+                    # Export slide as image
                     export_width = int(1920 * (full_dpi / 96))
 
-                    # Try export with retries
+                    success = False
                     for retry in range(3):
                         try:
                             slide.Export(str(img_path), "PNG", export_width)
-                            time.sleep(0.1)  # Small delay for file write
-                            if img_path.exists() and img_path.stat().st_size > 0:
-                                break
-                        except Exception:
                             time.sleep(0.2)
 
-                    if img_path.exists() and img_path.stat().st_size > 0:
+                            if img_path.exists() and img_path.stat().st_size > 1000:
+                                success = True
+                                break
+                        except Exception:
+                            time.sleep(0.3)
+
+                    if success and img_path.exists():
                         img = Image.open(img_path)
                         thumbnail = img.copy()
                         thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
