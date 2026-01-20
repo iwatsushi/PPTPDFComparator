@@ -556,45 +556,9 @@ class Document:
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir_path = Path(tmpdir)
 
-                # Method 1: Bulk export via SaveAs (faster)
-                export_folder = tmpdir_path / "slides"
-                export_folder.mkdir(exist_ok=True)
-
-                try:
-                    export_path = str(export_folder / "slide.png")
-                    presentation.SaveAs(export_path, 18)  # 18 = ppSaveAsPNG
-
-                    # Use polling instead of fixed sleep
-                    png_files = _wait_for_files(export_folder, total, timeout=15.0)
-
-                    # Sort by slide number
-                    def extract_number(path: Path) -> int:
-                        match = re.search(r'(\d+)', path.stem)
-                        return int(match.group(1)) if match else 0
-
-                    png_files = sorted(set(png_files), key=extract_number)
-
-                    if png_files and len(png_files) >= total:
-                        # Load images (pHash deferred)
-                        for i, png_file in enumerate(png_files[:total]):
-                            if progress_callback:
-                                progress_callback(i + 1, total)
-
-                            img = Image.open(png_file)
-                            thumbnail = img.copy()
-                            thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
-
-                            page = Page(index=i, thumbnail=thumbnail)
-                            self.pages.append(page)
-
-                        return  # Success (pHash deferred to ensure_hashes_computed)
-
-                except Exception:
-                    pass  # Fall through to individual export
-
-                # Method 2: Individual slide export (fallback)
-                # High resolution export for better quality
-                export_width = 1920
+                # High resolution individual slide export
+                # 2560px width for high quality comparison (4K would be 3840)
+                export_width = 2560
 
                 for i in range(1, total + 1):
                     if progress_callback:
