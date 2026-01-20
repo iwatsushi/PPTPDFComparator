@@ -1557,6 +1557,14 @@ class MainWindow(wx.Frame):
         if self._diff_summary_dialog:
             self._diff_summary_dialog.Destroy()
             self._diff_summary_dialog = None
+
+        # Close PowerPoint cache if used
+        try:
+            from ..core.document import close_powerpoint_cache
+            close_powerpoint_cache()
+        except Exception:
+            pass
+
         event.Skip()
 
     def _get_diff_pages(self) -> List[tuple]:

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import io
 import tempfile
+import time
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, List
+from typing import TYPE_CHECKING, Optional, List, Tuple
 from enum import Enum
-import hashlib
 
 import numpy as np
 from PIL import Image
@@ -16,6 +17,135 @@ import imagehash
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+
+# PowerPoint instance cache for faster subsequent loads
+_powerpoint_cache = {
+    'instance': None,
+    'initialized': False
+}
+
+
+def _wait_for_files(folder: Path, min_count: int, timeout: float = 10.0, interval: float = 0.1) -> List[Path]:
+    """Wait for PNG files to appear in folder with polling instead of fixed sleep.
+
+    Args:
+        folder: Directory to watch
+        min_count: Minimum number of files expected
+        timeout: Maximum wait time in seconds
+        interval: Polling interval in seconds
+
+    Returns:
+        List of found PNG files
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        png_files = []
+        for pattern in ["**/*.PNG", "**/*.png"]:
+            png_files.extend(folder.glob(pattern))
+        png_files = list(set(png_files))
+        if len(png_files) >= min_count:
+            return png_files
+        time.sleep(interval)
+    return png_files
+
+
+def _wait_for_file(path: Path, timeout: float = 5.0, min_size: int = 1000) -> bool:
+    """Wait for a file to exist and have minimum size.
+
+    Args:
+        path: File path to wait for
+        timeout: Maximum wait time in seconds
+        min_size: Minimum file size in bytes
+
+    Returns:
+        True if file exists and meets size requirement
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        if path.exists() and path.stat().st_size >= min_size:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _compute_phash_for_image(args: Tuple[int, Image.Image, int]) -> Tuple[int, imagehash.ImageHash]:
+    """Compute pHash for a single image (for parallel processing).
+
+    Args:
+        args: Tuple of (index, thumbnail, hash_size)
+
+    Returns:
+        Tuple of (index, computed hash)
+    """
+    idx, thumbnail, hash_size = args
+    return idx, imagehash.phash(thumbnail, hash_size=hash_size)
+
+
+def _compute_phashes_parallel(pages: List['Page'], hash_size: int = 16, max_workers: int = 4) -> None:
+    """Compute pHashes for all pages in parallel.
+
+    Args:
+        pages: List of Page objects with thumbnails
+        hash_size: Hash size for pHash
+        max_workers: Maximum number of parallel workers
+    """
+    # Prepare work items
+    work_items = [
+        (i, page.thumbnail, hash_size)
+        for i, page in enumerate(pages)
+        if page.thumbnail is not None and page.phash is None
+    ]
+
+    if not work_items:
+        return
+
+    # Use ThreadPoolExecutor for parallel computation
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_compute_phash_for_image, item): item[0] for item in work_items}
+        for future in as_completed(futures):
+            try:
+                idx, phash = future.result()
+                pages[idx].phash = phash
+            except Exception:
+                pass  # Skip failed hashes
+
+
+def get_powerpoint_instance():
+    """Get or create cached PowerPoint COM instance.
+
+    Returns:
+        Tuple of (powerpoint_app, need_to_close) where need_to_close indicates
+        if caller should close the instance
+    """
+    import sys
+    if sys.platform != 'win32':
+        raise RuntimeError("PowerPoint COM is only available on Windows")
+
+    import comtypes
+    import comtypes.client
+
+    if not _powerpoint_cache['initialized']:
+        comtypes.CoInitialize()
+        _powerpoint_cache['initialized'] = True
+
+    if _powerpoint_cache['instance'] is None:
+        powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
+        powerpoint.Visible = 1
+        _powerpoint_cache['instance'] = powerpoint
+        return powerpoint, False  # Don't close - it's cached
+
+    return _powerpoint_cache['instance'], False
+
+
+def close_powerpoint_cache():
+    """Close cached PowerPoint instance."""
+    if _powerpoint_cache['instance'] is not None:
+        try:
+            _powerpoint_cache['instance'].Quit()
+        except Exception:
+            pass
+        _powerpoint_cache['instance'] = None
 
 
 class DocumentType(Enum):
@@ -129,7 +259,11 @@ class Document:
         full_dpi: int,
         progress_callback: Optional[callable]
     ) -> None:
-        """Load pages from PDF file using PyMuPDF."""
+        """Load pages from PDF file using PyMuPDF.
+
+        Optimizations:
+        - Parallel pHash computation for many pages
+        """
         import fitz  # PyMuPDF
 
         doc = fitz.open(str(self.path))
@@ -140,6 +274,7 @@ class Document:
         zoom = 3.0  # 3x zoom for better quality
         mat = fitz.Matrix(zoom, zoom)
 
+        # First pass: load all thumbnails
         for i in range(total):
             if progress_callback:
                 progress_callback(i + 1, total)
@@ -148,17 +283,19 @@ class Document:
             pix = page.get_pixmap(matrix=mat)
 
             # Convert to PIL Image
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
             # Create thumbnail
             thumbnail = img.copy()
             thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
 
             page_obj = Page(index=i, thumbnail=thumbnail)
-            page_obj.compute_phash()
             self.pages.append(page_obj)
 
         doc.close()
+
+        # Second pass: compute pHashes in parallel
+        _compute_phashes_parallel(self.pages, hash_size=16, max_workers=4)
         # Note: Full images are loaded on-demand to save memory
 
     def _load_pptx(
@@ -208,39 +345,38 @@ class Document:
         full_dpi: int,
         progress_callback: Optional[callable]
     ) -> None:
-        """Convert PPTX to images using PowerPoint COM automation (Windows only)."""
+        """Convert PPTX to images using PowerPoint COM automation (Windows only).
+
+        Optimizations:
+        - Cached PowerPoint instance (faster subsequent loads)
+        - Polling instead of fixed sleep (faster)
+        - Parallel pHash computation (faster for many slides)
+        - Optimized export resolution (1280px width for thumbnails)
+        """
         import sys
-        import time
         if sys.platform != 'win32':
             raise RuntimeError("PowerPoint COM is only available on Windows")
 
         try:
-            import comtypes
             import comtypes.client
         except ImportError:
             raise RuntimeError("comtypes not installed. Run: pip install comtypes")
 
-        powerpoint = None
         presentation = None
+        powerpoint = None
+        should_close_ppt = True
+
         try:
-            # Initialize COM
-            comtypes.CoInitialize()
-            powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
-            powerpoint.Visible = 1  # Must be visible for export
+            # Use cached PowerPoint instance
+            powerpoint, should_close_ppt = get_powerpoint_instance()
 
-            # Give PowerPoint time to initialize
-            time.sleep(0.5)
-
-            # Open presentation with window (some environments need this)
+            # Open presentation (no fixed sleep - PowerPoint is already running)
             presentation = powerpoint.Presentations.Open(
                 str(self.path.absolute()),
                 ReadOnly=True,
                 Untitled=False,
-                WithWindow=True  # Changed to True for better compatibility
+                WithWindow=True
             )
-
-            # Wait for presentation to fully load
-            time.sleep(0.5)
 
             total = presentation.Slides.Count
             self.pages = []
@@ -248,33 +384,26 @@ class Document:
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir_path = Path(tmpdir)
 
-                # Method 1: Try exporting all slides at once using SaveAs
-                # This often works better than individual slide export
+                # Method 1: Bulk export via SaveAs (faster)
                 export_folder = tmpdir_path / "slides"
                 export_folder.mkdir(exist_ok=True)
 
                 try:
-                    # Export all slides as PNG using SaveAs (ppSaveAsPNG = 18)
                     export_path = str(export_folder / "slide.png")
                     presentation.SaveAs(export_path, 18)  # 18 = ppSaveAsPNG
-                    time.sleep(1)
 
-                    # PowerPoint creates files in a subfolder with slide names
-                    # Find all PNG files recursively
-                    png_files = []
-                    for pattern in ["**/*.PNG", "**/*.png"]:
-                        png_files.extend(export_folder.glob(pattern))
+                    # Use polling instead of fixed sleep
+                    png_files = _wait_for_files(export_folder, total, timeout=15.0)
 
-                    # Sort by filename to get correct order (slide1, slide2, etc.)
-                    # Extract number from filename for proper sorting
-                    def extract_number(path):
-                        import re
+                    # Sort by slide number
+                    def extract_number(path: Path) -> int:
                         match = re.search(r'(\d+)', path.stem)
                         return int(match.group(1)) if match else 0
 
                     png_files = sorted(set(png_files), key=extract_number)
 
                     if png_files and len(png_files) >= total:
+                        # Load images without computing pHash yet
                         for i, png_file in enumerate(png_files[:total]):
                             if progress_callback:
                                 progress_callback(i + 1, total)
@@ -284,13 +413,19 @@ class Document:
                             thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
 
                             page = Page(index=i, thumbnail=thumbnail)
-                            page.compute_phash()
                             self.pages.append(page)
-                        return  # Success with SaveAs method
-                except Exception:
-                    pass  # Fall through to individual export method
 
-                # Method 2: Export slides individually (fallback)
+                        # Compute pHashes in parallel
+                        _compute_phashes_parallel(self.pages, hash_size=16, max_workers=4)
+                        return  # Success
+
+                except Exception:
+                    pass  # Fall through to individual export
+
+                # Method 2: Individual slide export (fallback)
+                # Use lower resolution for speed (1280px instead of 1920px * dpi factor)
+                export_width = 1280
+
                 for i in range(1, total + 1):
                     if progress_callback:
                         progress_callback(i, total)
@@ -298,35 +433,29 @@ class Document:
                     slide = presentation.Slides(i)
                     img_path = tmpdir_path / f"slide_{i}.png"
 
-                    # Export slide as image
-                    export_width = int(1920 * (full_dpi / 96))
+                    try:
+                        slide.Export(str(img_path), "PNG", export_width)
 
-                    success = False
-                    for retry in range(3):
-                        try:
-                            slide.Export(str(img_path), "PNG", export_width)
-                            time.sleep(0.2)
+                        # Use polling instead of fixed sleep
+                        if _wait_for_file(img_path, timeout=3.0, min_size=1000):
+                            img = Image.open(img_path)
+                            thumbnail = img.copy()
+                            thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
 
-                            if img_path.exists() and img_path.stat().st_size > 1000:
-                                success = True
-                                break
-                        except Exception:
-                            time.sleep(0.3)
-
-                    if success and img_path.exists():
-                        img = Image.open(img_path)
-                        thumbnail = img.copy()
-                        thumbnail.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
-
-                        page = Page(index=i - 1, thumbnail=thumbnail)
-                        page.compute_phash()
-                        self.pages.append(page)
-                    else:
-                        # Create placeholder if export failed
+                            page = Page(index=i - 1, thumbnail=thumbnail)
+                            self.pages.append(page)
+                        else:
+                            # Create placeholder if export failed
+                            thumbnail = Image.new('RGB', thumbnail_size, color=(200, 200, 200))
+                            page = Page(index=i - 1, thumbnail=thumbnail)
+                            self.pages.append(page)
+                    except Exception:
                         thumbnail = Image.new('RGB', thumbnail_size, color=(200, 200, 200))
                         page = Page(index=i - 1, thumbnail=thumbnail)
-                        page.compute_phash()
                         self.pages.append(page)
+
+                # Compute pHashes in parallel for all pages
+                _compute_phashes_parallel(self.pages, hash_size=16, max_workers=4)
 
         finally:
             try:
@@ -334,11 +463,12 @@ class Document:
                     presentation.Close()
             except Exception:
                 pass
-            try:
-                if powerpoint:
+            # Don't close PowerPoint if using cache
+            if should_close_ppt and powerpoint:
+                try:
                     powerpoint.Quit()
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
     def _convert_pptx_via_pdf(
         self,
@@ -404,7 +534,7 @@ class Document:
             mat = fitz.Matrix(zoom, zoom)
             pix = pdf_page.get_pixmap(matrix=mat)
 
-            page.full_image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page.full_image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             doc.close()
         else:
             # For PPTX, we'd need similar on-demand conversion

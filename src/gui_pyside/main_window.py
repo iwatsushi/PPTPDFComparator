@@ -1735,3 +1735,19 @@ class MainWindow(QMainWindow):
                 self._load_document(valid_files[0], "left")
 
         event.acceptProposedAction()
+
+    def closeEvent(self, event) -> None:
+        """Handle window close event."""
+        # Close diff summary dialog if open
+        if self._diff_summary_dialog:
+            self._diff_summary_dialog.close()
+            self._diff_summary_dialog = None
+
+        # Close PowerPoint cache if used
+        try:
+            from ..core.document import close_powerpoint_cache
+            close_powerpoint_cache()
+        except Exception:
+            pass
+
+        super().closeEvent(event)
