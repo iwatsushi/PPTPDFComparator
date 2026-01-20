@@ -1217,20 +1217,17 @@ class MainWindow(wx.Frame):
             right_page = self.right_doc.pages[right_idx]
 
             if left_page.thumbnail and right_page.thumbnail:
-                # Get exclusion zones for each side
-                left_zones = self.exclusion_zones.get_zones_for("left")
-                right_zones = self.exclusion_zones.get_zones_for("right")
+                # Get all exclusion zones (applied to both sides)
+                all_zones = self.exclusion_zones.zones
 
-                # Compare the images (with exclusion zones)
+                # Compare the images with all exclusion zones
                 diff_result = comparator.compare(
                     left_page.thumbnail, right_page.thumbnail,
-                    exclusion_zones=left_zones
+                    exclusion_zones=all_zones
                 )
 
                 # Store whether there are differences (for link coloring)
-                # Use has_differences which checks both diff_score and region count
                 self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
-
 
                 # Apply highlighted images to thumbnails
                 if diff_result.highlight_image:
@@ -1241,7 +1238,7 @@ class MainWindow(wx.Frame):
                     # Also create highlight for right side (compare right to left)
                     diff_result_right = comparator.compare(
                         right_page.thumbnail, left_page.thumbnail,
-                        exclusion_zones=right_zones
+                        exclusion_zones=all_zones
                     )
                     if diff_result_right.highlight_image:
                         right_highlight_bitmap = pil_to_wxbitmap(diff_result_right.highlight_image)
@@ -1661,18 +1658,12 @@ class MainWindow(wx.Frame):
 
     def on_exclusion_zone_drawn(self, side: str, page_index: int, x: float, y: float, w: float, h: float) -> None:
         """Handle exclusion zone drawn on a thumbnail."""
-        # Determine applies_to based on side
-        if side == "left":
-            applies_to = AppliesTo.LEFT
-        else:
-            applies_to = AppliesTo.RIGHT
-
-        # Create zone with auto-generated name
+        # Always apply to BOTH sides for consistent comparison
         zone_count = len(self.exclusion_zones.zones) + 1
         zone = ExclusionZone(
             x=x, y=y, width=w, height=h,
             name=f"手動領域 {zone_count}",
-            applies_to=applies_to
+            applies_to=AppliesTo.BOTH
         )
         self.exclusion_zones.add(zone)
         self.session.exclusion_zones = self.exclusion_zones
