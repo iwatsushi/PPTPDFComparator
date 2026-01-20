@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import tempfile
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, List, Tuple
+from typing import TYPE_CHECKING, Optional, List, Tuple, Dict, Any
 from enum import Enum
 
 import numpy as np
@@ -24,6 +27,101 @@ _powerpoint_cache = {
     'instance': None,
     'initialized': False
 }
+
+# Disk cache directory
+_CACHE_DIR: Optional[Path] = None
+
+
+def _get_cache_dir() -> Path:
+    """Get or create the cache directory."""
+    global _CACHE_DIR
+    if _CACHE_DIR is None:
+        # Use user's home directory for cache
+        home = Path.home()
+        _CACHE_DIR = home / ".pptpdf_cache"
+        _CACHE_DIR.mkdir(exist_ok=True)
+    return _CACHE_DIR
+
+
+def _get_cache_key(file_path: Path) -> str:
+    """Generate a cache key based on file path and modification time."""
+    mtime = file_path.stat().st_mtime
+    size = file_path.stat().st_size
+    key_str = f"{file_path.absolute()}|{mtime}|{size}"
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+
+def _get_cached_thumbnails(file_path: Path) -> Optional[Dict[int, Path]]:
+    """Check if cached thumbnails exist for this file.
+
+    Returns:
+        Dict mapping page index to cached PNG path, or None if not cached
+    """
+    cache_key = _get_cache_key(file_path)
+    cache_subdir = _get_cache_dir() / cache_key
+
+    if not cache_subdir.exists():
+        return None
+
+    meta_file = cache_subdir / "meta.json"
+    if not meta_file.exists():
+        return None
+
+    try:
+        with open(meta_file, 'r') as f:
+            meta = json.load(f)
+
+        # Verify the cache is still valid
+        if meta.get('source_path') != str(file_path.absolute()):
+            return None
+
+        # Find all cached pages
+        cached = {}
+        for png in cache_subdir.glob("page_*.png"):
+            try:
+                idx = int(png.stem.split('_')[1])
+                cached[idx] = png
+            except (ValueError, IndexError):
+                pass
+
+        if len(cached) >= meta.get('page_count', 0):
+            return cached
+
+    except Exception:
+        pass
+
+    return None
+
+
+def _save_to_cache(file_path: Path, pages: List['Page']) -> None:
+    """Save thumbnails to disk cache."""
+    cache_key = _get_cache_key(file_path)
+    cache_subdir = _get_cache_dir() / cache_key
+    cache_subdir.mkdir(exist_ok=True)
+
+    # Save metadata
+    meta = {
+        'source_path': str(file_path.absolute()),
+        'page_count': len(pages),
+        'cached_at': time.time()
+    }
+    with open(cache_subdir / "meta.json", 'w') as f:
+        json.dump(meta, f)
+
+    # Save thumbnails
+    for page in pages:
+        if page.thumbnail is not None:
+            png_path = cache_subdir / f"page_{page.index}.png"
+            page.thumbnail.save(png_path, "PNG")
+
+
+def clear_cache() -> None:
+    """Clear all cached thumbnails."""
+    import shutil
+    cache_dir = _get_cache_dir()
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+        cache_dir.mkdir(exist_ok=True)
 
 
 def _wait_for_files(folder: Path, min_count: int, timeout: float = 10.0, interval: float = 0.1) -> List[Path]:
@@ -189,12 +287,19 @@ class Page:
 
 @dataclass
 class Document:
-    """Represents a document (PDF or PowerPoint) as a collection of pages."""
+    """Represents a document (PDF or PowerPoint) as a collection of pages.
+
+    Optimizations:
+    - Disk cache: Thumbnails are cached to disk for instant reload
+    - Deferred pHash: pHash is computed only when needed for comparison
+    """
 
     path: Path
     doc_type: DocumentType
     pages: List[Page] = field(default_factory=list)
     _loaded: bool = False
+    _hashes_computed: bool = False
+    _thumbnail_size: tuple[int, int] = field(default=(800, 600), repr=False)
 
     @classmethod
     def from_file(cls, file_path: str | Path) -> Document:
@@ -232,9 +337,10 @@ class Document:
 
     def load(
         self,
-        thumbnail_size: tuple[int, int] = (800, 600),  # 高解像度サムネイル
-        full_dpi: int = 200,  # 高DPI
-        progress_callback: Optional[callable] = None
+        thumbnail_size: tuple[int, int] = (800, 600),
+        full_dpi: int = 200,
+        progress_callback: Optional[callable] = None,
+        use_cache: bool = True
     ) -> None:
         """Load all pages from the document.
 
@@ -242,16 +348,82 @@ class Document:
             thumbnail_size: Size for thumbnail images (width, height)
             full_dpi: DPI for full resolution images
             progress_callback: Optional callback(current, total) for progress
+            use_cache: Whether to use disk cache (default True)
         """
         if self._loaded:
             return
 
+        self._thumbnail_size = thumbnail_size
+
+        # Try loading from cache first
+        if use_cache:
+            cached = _get_cached_thumbnails(self.path)
+            if cached:
+                print(f"[DEBUG] Loading from cache: {len(cached)} pages")
+                self._load_from_cache(cached, progress_callback)
+                self._loaded = True
+                return
+
+        # Load from source
         if self.doc_type == DocumentType.PDF:
             self._load_pdf(thumbnail_size, full_dpi, progress_callback)
         elif self.doc_type in (DocumentType.PPTX, DocumentType.PPT):
             self._load_pptx(thumbnail_size, full_dpi, progress_callback)
 
         self._loaded = True
+
+        # Save to cache for next time
+        if use_cache and self.pages:
+            try:
+                _save_to_cache(self.path, self.pages)
+                print(f"[DEBUG] Saved {len(self.pages)} pages to cache")
+            except Exception as e:
+                print(f"[DEBUG] Cache save failed: {e}")
+
+    def _load_from_cache(
+        self,
+        cached: Dict[int, Path],
+        progress_callback: Optional[callable]
+    ) -> None:
+        """Load thumbnails from disk cache."""
+        total = len(cached)
+        self.pages = []
+
+        for i in range(total):
+            if progress_callback:
+                progress_callback(i + 1, total)
+
+            if i in cached:
+                thumbnail = Image.open(cached[i])
+                page = Page(index=i, thumbnail=thumbnail)
+            else:
+                # Missing page - create placeholder
+                thumbnail = Image.new('RGB', self._thumbnail_size, color=(200, 200, 200))
+                page = Page(index=i, thumbnail=thumbnail)
+
+            self.pages.append(page)
+
+    def ensure_hashes_computed(self, progress_callback: Optional[callable] = None) -> None:
+        """Compute pHashes for all pages if not already done.
+
+        This is called before comparison to ensure hashes are available.
+        Deferred computation saves time during initial load.
+        """
+        if self._hashes_computed:
+            return
+
+        # Check which pages need hashes
+        pages_needing_hash = [p for p in self.pages if p.phash is None and p.thumbnail is not None]
+
+        if not pages_needing_hash:
+            self._hashes_computed = True
+            return
+
+        print(f"[DEBUG] Computing pHashes for {len(pages_needing_hash)} pages...")
+
+        # Compute in parallel
+        _compute_phashes_parallel(self.pages, hash_size=16, max_workers=4)
+        self._hashes_computed = True
 
     def _load_pdf(
         self,
@@ -261,8 +433,7 @@ class Document:
     ) -> None:
         """Load pages from PDF file using PyMuPDF.
 
-        Optimizations:
-        - Parallel pHash computation for many pages
+        Note: pHash computation is deferred until ensure_hashes_computed() is called.
         """
         import fitz  # PyMuPDF
 
@@ -274,7 +445,6 @@ class Document:
         zoom = 3.0  # 3x zoom for better quality
         mat = fitz.Matrix(zoom, zoom)
 
-        # First pass: load all thumbnails
         for i in range(total):
             if progress_callback:
                 progress_callback(i + 1, total)
@@ -293,9 +463,7 @@ class Document:
             self.pages.append(page_obj)
 
         doc.close()
-
-        # Second pass: compute pHashes in parallel
-        _compute_phashes_parallel(self.pages, hash_size=16, max_workers=4)
+        # Note: pHash computation deferred to ensure_hashes_computed()
         # Note: Full images are loaded on-demand to save memory
 
     def _load_pptx(
@@ -336,7 +504,6 @@ class Document:
             # Create a placeholder thumbnail with text
             thumbnail = Image.new('RGB', thumbnail_size, color=(200, 200, 200))
             page = Page(index=i, thumbnail=thumbnail)
-            page.compute_phash()
             self.pages.append(page)
 
     def _convert_pptx_via_com(
@@ -403,7 +570,7 @@ class Document:
                     png_files = sorted(set(png_files), key=extract_number)
 
                     if png_files and len(png_files) >= total:
-                        # Load images without computing pHash yet
+                        # Load images (pHash deferred)
                         for i, png_file in enumerate(png_files[:total]):
                             if progress_callback:
                                 progress_callback(i + 1, total)
@@ -415,9 +582,7 @@ class Document:
                             page = Page(index=i, thumbnail=thumbnail)
                             self.pages.append(page)
 
-                        # Compute pHashes in parallel
-                        _compute_phashes_parallel(self.pages, hash_size=16, max_workers=4)
-                        return  # Success
+                        return  # Success (pHash deferred to ensure_hashes_computed)
 
                 except Exception:
                     pass  # Fall through to individual export
@@ -454,8 +619,7 @@ class Document:
                         page = Page(index=i - 1, thumbnail=thumbnail)
                         self.pages.append(page)
 
-                # Compute pHashes in parallel for all pages
-                _compute_phashes_parallel(self.pages, hash_size=16, max_workers=4)
+                # pHash deferred to ensure_hashes_computed()
 
         finally:
             try:

@@ -216,9 +216,9 @@ class PageMatcher:
         if n_left == 0 or n_right == 0:
             return self._handle_empty_documents(n_left, n_right)
 
-        # Ensure all pages have hashes
-        for page in left_pages + right_pages:
-            page.compute_phash(self.hash_size)
+        # Ensure all pages have hashes (uses parallel computation)
+        left_doc.ensure_hashes_computed()
+        right_doc.ensure_hashes_computed()
 
         if progress_callback:
             progress_callback(0, n_left * n_right, "Computing similarity matrix...")
