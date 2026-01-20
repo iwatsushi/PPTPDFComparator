@@ -229,7 +229,12 @@ def get_powerpoint_instance():
 
     if _powerpoint_cache['instance'] is None:
         powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
-        powerpoint.Visible = 1
+        # Keep PowerPoint hidden (WindowState: 2=Minimized, Visible=0 may cause export issues)
+        try:
+            powerpoint.Visible = 1  # Must be visible for export to work
+            powerpoint.WindowState = 2  # ppWindowMinimized = 2
+        except Exception:
+            powerpoint.Visible = 1  # Fallback to visible
         _powerpoint_cache['instance'] = powerpoint
         return powerpoint, False  # Don't close - it's cached
 
@@ -537,12 +542,12 @@ class Document:
             # Use cached PowerPoint instance
             powerpoint, should_close_ppt = get_powerpoint_instance()
 
-            # Open presentation (no fixed sleep - PowerPoint is already running)
+            # Open presentation without window (minimized PowerPoint)
             presentation = powerpoint.Presentations.Open(
                 str(self.path.absolute()),
                 ReadOnly=True,
                 Untitled=False,
-                WithWindow=True
+                WithWindow=False  # No window - faster and less intrusive
             )
 
             total = presentation.Slides.Count
