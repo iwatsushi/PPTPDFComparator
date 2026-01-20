@@ -50,8 +50,9 @@ class DiffResult:
 
     @property
     def has_differences(self) -> bool:
-        """Check if there are any differences."""
-        return self.diff_score > 0.01 or len(self.regions) > 0
+        """Check if there are any meaningful differences."""
+        # diff_score > 0.5% and at least one region detected
+        return self.diff_score > 0.005 and len(self.regions) > 0
 
     @property
     def diff_count(self) -> int:
@@ -64,10 +65,10 @@ class ImageComparator:
 
     def __init__(
         self,
-        threshold: int = 5,  # 非常に低い閾値で文字の差分も検出
-        min_region_area: int = 10,  # 非常に小さい領域も検出（文字1文字分程度）
+        threshold: int = 30,  # レンダリング差を吸収する閾値
+        min_region_area: int = 100,  # ノイズを除去（小さすぎる差分は無視）
         highlight_color: Tuple[int, int, int] = (255, 0, 0),
-        highlight_alpha: float = 0.5,  # より目立つハイライト
+        highlight_alpha: float = 0.5,
     ):
         """Initialize the comparator.
 

@@ -39,7 +39,8 @@ class MatchResult:
         """Check if matched pages have differences."""
         if self.status != MatchStatus.MATCHED:
             return True
-        return self.similarity < 0.99
+        # 95%類似度以上なら同一とみなす（異なるレンダラー間の差を許容）
+        return self.similarity < 0.95
 
 
 @dataclass
