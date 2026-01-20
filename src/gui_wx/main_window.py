@@ -650,7 +650,8 @@ class MainWindow(wx.Frame):
 
         # Bottom sync scroll bar area
         sync_panel = wx.Panel(panel)
-        sync_panel.SetBackgroundColour(wx.Colour(240, 240, 240))
+        sync_panel.SetBackgroundColour(wx.Colour(220, 220, 220))
+        sync_panel.SetMinSize((-1, 40))
         sync_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
         sync_label = wx.StaticText(sync_panel, label="連動スクロール:")

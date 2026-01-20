@@ -79,13 +79,18 @@ pyinstaller --onefile --windowed --name PPTPDFComparator \
 **Note:** PowerPoint files require Microsoft PowerPoint installed on the target machine.
 
 ## System Dependencies
-- **Poppler**: Required for PDF rendering
-  - Windows: Download from https://github.com/oschwartz10612/poppler-windows/releases
-  - Mac: `brew install poppler`
-  - Linux: `apt install poppler-utils`
 
-- **LibreOffice** (optional): For PPTX to image conversion
-  - Used when converting PowerPoint files to images
+### PDF Rendering
+- **PyMuPDF (fitz)**: Included in Python dependencies, no external install needed
+
+### PPTX Rendering (one of the following required)
+- **Windows with Microsoft PowerPoint**: Uses COM automation (recommended)
+- **LibreOffice**: Required if PowerPoint is not available
+  - Windows: Download from https://www.libreoffice.org/download/
+  - Mac: `brew install --cask libreoffice`
+  - Linux: `apt install libreoffice`
+
+**Note:** If neither PowerPoint nor LibreOffice is installed, PPTX files will show gray placeholder images.
 
 ## Key Features
 - ドラッグ&ドロップでファイル読込
