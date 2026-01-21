@@ -1768,17 +1768,6 @@ class MainWindow(QMainWindow):
             f"除外領域を追加しました: {zone.name} ({x*100:.0f}%, {y*100:.0f}%, {w*100:.0f}%x{h*100:.0f}%)"
         )
 
-        # Auto re-compare in background
-        if self.left_doc and self.right_doc:
-            QTimer.singleShot(100, self._run_comparison_background)
-
-    def _run_comparison_background(self) -> None:
-        """Run comparison in a non-blocking way."""
-        if not self.left_doc or not self.right_doc:
-            return
-        # Run comparison (this already has progress dialog which allows events)
-        self._run_comparison()
-
     def _remove_last_exclusion_zone(self) -> None:
         """Remove the most recently added exclusion zone."""
         if self.exclusion_zones.zones:
@@ -1786,9 +1775,6 @@ class MainWindow(QMainWindow):
             self.session.exclusion_zones = self.exclusion_zones
             self._update_exclusion_zone_overlays()
             self.statusbar.showMessage(f"除外領域を削除しました: {removed.name}")
-            # Auto re-compare
-            if self.left_doc and self.right_doc:
-                QTimer.singleShot(100, self._run_comparison_background)
 
     def _clear_all_exclusion_zones(self) -> None:
         """Clear all exclusion zones."""
@@ -1798,9 +1784,6 @@ class MainWindow(QMainWindow):
             self.session.exclusion_zones = self.exclusion_zones
             self._update_exclusion_zone_overlays()
             self.statusbar.showMessage(f"全ての除外領域を削除しました ({count} 領域)")
-            # Auto re-compare
-            if self.left_doc and self.right_doc:
-                QTimer.singleShot(100, self._run_comparison_background)
 
     def _delete_exclusion_zone(self, zone_index: int) -> None:
         """Delete a specific exclusion zone by index."""
@@ -1809,9 +1792,6 @@ class MainWindow(QMainWindow):
             self.session.exclusion_zones = self.exclusion_zones
             self._update_exclusion_zone_overlays()
             self.statusbar.showMessage(f"除外領域を削除しました: {removed.name}")
-            # Auto re-compare
-            if self.left_doc and self.right_doc:
-                QTimer.singleShot(100, self._run_comparison_background)
 
     def _update_exclusion_zone_overlays(self) -> None:
         """Update exclusion zone overlays on both panels."""

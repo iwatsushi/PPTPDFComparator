@@ -1738,10 +1738,6 @@ class MainWindow(wx.Frame):
             f"除外領域を追加しました: {zone.name} ({x*100:.0f}%, {y*100:.0f}%, {w*100:.0f}%x{h*100:.0f}%)"
         )
 
-        # Auto re-compare in background
-        if self.left_doc and self.right_doc:
-            wx.CallLater(100, self._run_comparison, None)
-
     def on_exclusion_zone_delete(self, zone_index: int) -> None:
         """Handle exclusion zone delete request."""
         if 0 <= zone_index < len(self.exclusion_zones.zones):
@@ -1749,9 +1745,6 @@ class MainWindow(wx.Frame):
             self.session.exclusion_zones = self.exclusion_zones
             self._update_exclusion_zone_overlays()
             self.statusbar.SetStatusText(f"除外領域を削除しました: {removed.name}")
-            # Auto re-compare
-            if self.left_doc and self.right_doc:
-                wx.CallLater(100, self._run_comparison, None)
 
     def _remove_last_exclusion_zone(self, event: wx.Event) -> None:
         """Remove the most recently added exclusion zone."""
@@ -1760,9 +1753,6 @@ class MainWindow(wx.Frame):
             self.session.exclusion_zones = self.exclusion_zones
             self._update_exclusion_zone_overlays()
             self.statusbar.SetStatusText(f"除外領域を削除しました: {removed.name}")
-            # Auto re-compare
-            if self.left_doc and self.right_doc:
-                wx.CallLater(100, self._run_comparison, None)
 
     def _clear_all_exclusion_zones(self, event: wx.Event) -> None:
         """Clear all exclusion zones."""
@@ -1772,9 +1762,6 @@ class MainWindow(wx.Frame):
             self.session.exclusion_zones = self.exclusion_zones
             self._update_exclusion_zone_overlays()
             self.statusbar.SetStatusText(f"全ての除外領域を削除しました ({count} 領域)")
-            # Auto re-compare
-            if self.left_doc and self.right_doc:
-                wx.CallLater(100, self._run_comparison, None)
 
     def _update_exclusion_zone_overlays(self) -> None:
         """Update exclusion zone overlays on both panels."""
