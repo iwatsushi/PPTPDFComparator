@@ -57,6 +57,7 @@ def export_to_html(
     output_path: str | Path,
     config: Optional[ExportConfig] = None,
     exclusion_zones: Optional['ExclusionZoneSet'] = None,
+    highlight_images: Optional[dict] = None,
 ) -> None:
     """Export comparison report to HTML.
 
@@ -68,6 +69,8 @@ def export_to_html(
         output_path: Output HTML file path
         config: Export configuration
         exclusion_zones: Exclusion zones to display
+        highlight_images: Dictionary of (left_idx, right_idx) -> (left_highlight, right_highlight)
+                         PIL Images with diff highlights drawn
     """
     try:
         from src.core.page_matcher import MatchStatus
@@ -130,8 +133,12 @@ def export_to_html(
         html_parts.append('<h2 class="section-diff">Pages with Differences</h2>')
         html_parts.append('<div class="pages">')
         for match in matched_with_diff:
+            # Get highlight images if available
+            highlights = None
+            if highlight_images:
+                highlights = highlight_images.get((match.left_index, match.right_index))
             html_parts.append(_render_match_html(
-                match, left_doc, right_doc, config, has_diff=True
+                match, left_doc, right_doc, config, has_diff=True, highlights=highlights
             ))
         html_parts.append('</div>')
 
@@ -141,7 +148,7 @@ def export_to_html(
         html_parts.append('<div class="pages">')
         for match in matched_identical:
             html_parts.append(_render_match_html(
-                match, left_doc, right_doc, config, has_diff=False
+                match, left_doc, right_doc, config, has_diff=False, highlights=None
             ))
         html_parts.append('</div>')
 
@@ -237,9 +244,19 @@ def _render_match_html(
     left_doc: 'Document',
     right_doc: 'Document',
     config: ExportConfig,
-    has_diff: bool
+    has_diff: bool,
+    highlights: Optional[tuple] = None,
 ) -> str:
-    """Render HTML for a matched page pair."""
+    """Render HTML for a matched page pair.
+
+    Args:
+        match: Match result
+        left_doc: Left document
+        right_doc: Right document
+        config: Export configuration
+        has_diff: Whether there are differences
+        highlights: Optional tuple of (left_highlight, right_highlight) PIL Images
+    """
     left_page = left_doc.pages[match.left_index]
     right_page = right_doc.pages[match.right_index]
 
@@ -256,15 +273,27 @@ def _render_match_html(
     ]
 
     if config.include_thumbnails:
+        # Use highlight images if available, otherwise fall back to thumbnails
+        left_img = None
+        right_img = None
+
+        if highlights and has_diff:
+            left_highlight, right_highlight = highlights
+            left_img = left_highlight if left_highlight else left_page.thumbnail
+            right_img = right_highlight if right_highlight else right_page.thumbnail
+        else:
+            left_img = left_page.thumbnail
+            right_img = right_page.thumbnail
+
         # Left image
-        if left_page.thumbnail:
-            resized = _resize_image(left_page.thumbnail, config.thumbnail_width)
+        if left_img:
+            resized = _resize_image(left_img, config.thumbnail_width)
             b64 = _pil_to_base64(resized)
             parts.append(f'<div class="page-image"><img src="data:image/png;base64,{b64}" alt="Left Page {match.left_index + 1}"><p>Left: Page {match.left_index + 1}</p></div>')
 
         # Right image
-        if right_page.thumbnail:
-            resized = _resize_image(right_page.thumbnail, config.thumbnail_width)
+        if right_img:
+            resized = _resize_image(right_img, config.thumbnail_width)
             b64 = _pil_to_base64(resized)
             parts.append(f'<div class="page-image"><img src="data:image/png;base64,{b64}" alt="Right Page {match.right_index + 1}"><p>Right: Page {match.right_index + 1}</p></div>')
 
@@ -307,6 +336,7 @@ def export_to_pdf(
     output_path: str | Path,
     config: Optional[ExportConfig] = None,
     exclusion_zones: Optional['ExclusionZoneSet'] = None,
+    highlight_images: Optional[dict] = None,
 ) -> None:
     """Export comparison report to PDF.
 
@@ -318,6 +348,8 @@ def export_to_pdf(
         output_path: Output PDF file path
         config: Export configuration
         exclusion_zones: Exclusion zones to display
+        highlight_images: Dictionary of (left_idx, right_idx) -> (left_highlight, right_highlight)
+                         PIL Images with diff highlights drawn
     """
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
@@ -427,8 +459,12 @@ def export_to_pdf(
         story.append(Paragraph("Pages with Differences", heading_style))
 
         for match in matched_with_diff:
+            # Get highlight images if available
+            highlights = None
+            if highlight_images:
+                highlights = highlight_images.get((match.left_index, match.right_index))
             story.append(_render_match_pdf(
-                match, left_doc, right_doc, config, has_diff=True
+                match, left_doc, right_doc, config, has_diff=True, highlights=highlights
             ))
             story.append(Spacer(1, 15))
 
@@ -439,7 +475,7 @@ def export_to_pdf(
 
         for match in matched_identical:
             story.append(_render_match_pdf(
-                match, left_doc, right_doc, config, has_diff=False
+                match, left_doc, right_doc, config, has_diff=False, highlights=None
             ))
             story.append(Spacer(1, 15))
 
@@ -474,8 +510,18 @@ def _render_match_pdf(
     right_doc: 'Document',
     config: ExportConfig,
     has_diff: bool,
+    highlights: Optional[tuple] = None,
 ):
-    """Render PDF element for a matched page pair."""
+    """Render PDF element for a matched page pair.
+
+    Args:
+        match: Match result
+        left_doc: Left document
+        right_doc: Right document
+        config: Export configuration
+        has_diff: Whether there are differences
+        highlights: Optional tuple of (left_highlight, right_highlight) PIL Images
+    """
     from reportlab.lib import colors
     from reportlab.lib.units import mm
     from reportlab.platypus import Table, TableStyle, Paragraph
@@ -497,8 +543,20 @@ def _render_match_pdf(
 
     # Add images if available
     if config.include_thumbnails:
-        left_img = _pil_to_reportlab_image(left_page.thumbnail, 120*mm) if left_page.thumbnail else ""
-        right_img = _pil_to_reportlab_image(right_page.thumbnail, 120*mm) if right_page.thumbnail else ""
+        # Use highlight images if available, otherwise fall back to thumbnails
+        left_img_src = None
+        right_img_src = None
+
+        if highlights and has_diff:
+            left_highlight, right_highlight = highlights
+            left_img_src = left_highlight if left_highlight else left_page.thumbnail
+            right_img_src = right_highlight if right_highlight else right_page.thumbnail
+        else:
+            left_img_src = left_page.thumbnail
+            right_img_src = right_page.thumbnail
+
+        left_img = _pil_to_reportlab_image(left_img_src, 120*mm) if left_img_src else ""
+        right_img = _pil_to_reportlab_image(right_img_src, 120*mm) if right_img_src else ""
         data.append([left_img, "", right_img])
 
     table = Table(data, colWidths=[130*mm, 20*mm, 130*mm])

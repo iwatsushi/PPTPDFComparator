@@ -26,14 +26,14 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from src.core.document import Document
+    from src.core.document import Document, get_last_ppt_error, diagnose_powerpoint
     from src.core.page_matcher import PageMatcher, MatchingResult, MatchStatus
     from src.core.image_comparator import ImageComparator, DiffResult
     from src.core.exclusion_zone import ExclusionZone, ExclusionZoneSet, AppliesTo
     from src.core.session import Session
     from src.utils.image_utils import pil_to_qpixmap
 except ImportError:
-    from core.document import Document
+    from core.document import Document, get_last_ppt_error, diagnose_powerpoint
     from core.page_matcher import PageMatcher, MatchingResult, MatchStatus
     from core.image_comparator import ImageComparator, DiffResult
     from core.exclusion_zone import ExclusionZone, ExclusionZoneSet, AppliesTo
@@ -546,11 +546,16 @@ class DocumentPanel(QScrollArea):
             if thumb._original_pixmap is not None or thumb._highlight_pixmap is not None:
                 thumb._update_scaled_pixmap(target_width)
 
-    def set_document(self, document: Document) -> None:
-        """Set the document to display."""
+    def set_document(self, document: Document, progress_callback: Optional[callable] = None) -> None:
+        """Set the document to display.
+
+        Args:
+            document: Document to display
+            progress_callback: Optional callback(current, total, msg) for progress
+        """
         self.document = document
         self._update_header()
-        self._rebuild_thumbnails()
+        self._rebuild_thumbnails(progress_callback)
 
     def _update_header(self) -> None:
         """Update header with file information."""
@@ -565,7 +570,7 @@ class DocumentPanel(QScrollArea):
                 path_str = "..." + path_str[-47:]
             self.file_path_label.setText(f"{path_str}  ({self.document.page_count} pages)")
 
-    def _rebuild_thumbnails(self) -> None:
+    def _rebuild_thumbnails(self, progress_callback: Optional[callable] = None) -> None:
         """Rebuild thumbnail widgets from document."""
         # Clear existing
         for thumb in self.thumbnails:
@@ -579,7 +584,8 @@ class DocumentPanel(QScrollArea):
         self.placeholder.hide()
 
         # Create thumbnails
-        for page in self.document.pages:
+        total = len(self.document.pages)
+        for i, page in enumerate(self.document.pages):
             thumb = PageThumbnail(page.index, self.side)
             thumb.clicked.connect(self._on_page_clicked)
             thumb.double_clicked.connect(self._on_page_double_clicked)
@@ -592,6 +598,10 @@ class DocumentPanel(QScrollArea):
 
             self.thumbnails.append(thumb)
             self.layout.insertWidget(self.layout.count() - 1, thumb)
+
+            # Report progress every 10 pages
+            if progress_callback and (i + 1) % 10 == 0:
+                progress_callback(i + 1, total, f"Creating thumbnails... {i + 1}/{total}")
 
     def _on_exclusion_zone_drawn(self, side: str, page_index: int, x: float, y: float, w: float, h: float) -> None:
         """Forward exclusion zone signal to parent."""
@@ -1046,6 +1056,7 @@ class MainWindow(QMainWindow):
         self.matching_result: Optional[MatchingResult] = None
         self.exclusion_zones = ExclusionZoneSet()
         self.diff_scores: dict = {}  # (left_idx, right_idx) -> has_differences
+        self.diff_highlights: dict = {}  # (left_idx, right_idx) -> (left_highlight, right_highlight) PIL Images
 
         self._selected_left: Optional[int] = None
         self._selected_right: Optional[int] = None
@@ -1471,28 +1482,53 @@ class MainWindow(QMainWindow):
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.show()
 
-            def progress_callback(current, total):
+            def progress_callback(current, total, msg=""):
                 progress.setValue(int(current / total * 100))
+                if msg:
+                    progress.setLabelText(msg)
                 QApplication.processEvents()
 
             doc.load(progress_callback=progress_callback)
-            progress.close()
+
+            # Create thumbnails (also with progress)
+            progress.setLabelText("Creating thumbnails...")
+            progress.setValue(0)
 
             if side == "left":
                 self.left_doc = doc
-                self.left_panel.set_document(doc)
+                self.left_panel.set_document(doc, progress_callback)
                 self.session.left_document_path = path
             else:
                 self.right_doc = doc
-                self.right_panel.set_document(doc)
+                self.right_panel.set_document(doc, progress_callback)
                 self.session.right_document_path = path
+
+            progress.close()
+
+            # Check for PowerPoint conversion errors
+            ppt_error = get_last_ppt_error()
+            if ppt_error and path.lower().endswith(('.pptx', '.ppt')):
+                # Run diagnostics
+                diag = diagnose_powerpoint()
+                diag_msg = (
+                    f"\n\n診断情報:\n"
+                    f"- Python: {diag['python_bits']}-bit\n"
+                    f"- PowerPoint利用可能: {diag['powerpoint_available']}\n"
+                    f"- PowerPointバージョン: {diag.get('powerpoint_version', 'N/A')}\n"
+                    f"- comtypes: {'インストール済み' if diag['comtypes_installed'] else '未インストール'}\n"
+                    f"- エラー: {diag.get('error', 'なし')}"
+                )
+
+                QMessageBox.warning(
+                    self, "PowerPoint変換の警告",
+                    f"PowerPointファイルの変換に問題がありました。\n"
+                    f"画像はプレースホルダーとして表示されます。\n\n"
+                    f"エラー詳細:\n{ppt_error}"
+                    f"{diag_msg}"
+                )
 
             self._update_status()
             self._update_links()
-
-            # Auto-compare if both documents are loaded
-            if self.left_doc and self.right_doc:
-                QTimer.singleShot(100, self._run_comparison)
 
         except Exception as e:
             QMessageBox.critical(
@@ -1534,6 +1570,7 @@ class MainWindow(QMainWindow):
         matched_pairs = self.matching_result.get_matched_pairs()
         total_pairs = len(matched_pairs)
         self.diff_scores = {}  # Clear previous scores
+        self.diff_highlights = {}  # Clear previous highlights
 
         # Get all exclusion zones once
         all_zones = self.exclusion_zones.zones
@@ -1582,6 +1619,12 @@ class MainWindow(QMainWindow):
 
             # Store whether there are differences
             self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
+
+            # Store highlight images for export
+            self.diff_highlights[(left_idx, right_idx)] = (
+                diff_result.left_highlight,
+                diff_result.right_highlight
+            )
 
             # Apply highlighted images to thumbnails
             if diff_result.left_highlight:
@@ -1782,6 +1825,7 @@ class MainWindow(QMainWindow):
                 path,
                 config=config,
                 exclusion_zones=self.exclusion_zones,
+                highlight_images=self.diff_highlights,
             )
 
             QMessageBox.information(
@@ -1832,6 +1876,7 @@ class MainWindow(QMainWindow):
                 path,
                 config=config,
                 exclusion_zones=self.exclusion_zones,
+                highlight_images=self.diff_highlights,
             )
 
             QMessageBox.information(

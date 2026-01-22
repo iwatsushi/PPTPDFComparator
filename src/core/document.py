@@ -28,6 +28,63 @@ _powerpoint_cache = {
     'initialized': False
 }
 
+# Last PowerPoint error for diagnostics
+_last_ppt_error: Optional[str] = None
+
+
+def get_last_ppt_error() -> Optional[str]:
+    """Get the last PowerPoint conversion error message."""
+    return _last_ppt_error
+
+
+def diagnose_powerpoint() -> dict:
+    """Diagnose PowerPoint availability and COM setup.
+
+    Returns:
+        dict with diagnostic information
+    """
+    import sys
+    result = {
+        'platform': sys.platform,
+        'python_bits': 64 if sys.maxsize > 2**32 else 32,
+        'powerpoint_available': False,
+        'powerpoint_version': None,
+        'comtypes_installed': False,
+        'error': None
+    }
+
+    if sys.platform != 'win32':
+        result['error'] = 'Not running on Windows'
+        return result
+
+    try:
+        import comtypes
+        import comtypes.client
+        result['comtypes_installed'] = True
+    except ImportError:
+        result['error'] = 'comtypes not installed'
+        return result
+
+    try:
+        comtypes.CoInitialize()
+        powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
+        result['powerpoint_available'] = True
+        try:
+            result['powerpoint_version'] = powerpoint.Version
+        except Exception:
+            result['powerpoint_version'] = 'Unknown'
+
+        # Try to quit the test instance
+        try:
+            powerpoint.Quit()
+        except Exception:
+            pass
+
+    except Exception as e:
+        result['error'] = str(e)
+
+    return result
+
 # Disk cache directory
 _CACHE_DIR: Optional[Path] = None
 
@@ -377,13 +434,19 @@ class Document:
 
         self._loaded = True
 
-        # Save to cache for next time
+        # Save to cache in background (non-blocking)
         if use_cache and self.pages:
-            try:
-                _save_to_cache(self.path, self.pages)
-                print(f"[DEBUG] Saved {len(self.pages)} pages to cache")
-            except Exception as e:
-                print(f"[DEBUG] Cache save failed: {e}")
+            import threading
+
+            def save_cache_background():
+                try:
+                    _save_to_cache(self.path, self.pages)
+                    print(f"[DEBUG] Saved {len(self.pages)} pages to cache (background)")
+                except Exception as e:
+                    print(f"[DEBUG] Cache save failed: {e}")
+
+            cache_thread = threading.Thread(target=save_cache_background, daemon=True)
+            cache_thread.start()
 
     def _load_from_cache(
         self,
@@ -539,6 +602,7 @@ class Document:
         progress_callback: Optional[callable]
     ) -> None:
         """Load pages from PowerPoint file."""
+        global _last_ppt_error
         from pptx import Presentation
 
         prs = Presentation(str(self.path))
@@ -550,18 +614,23 @@ class Document:
             ("LibreOffice", self._convert_pptx_via_pdf),
         ]
 
+        errors = []
         for method_name, method in conversion_methods:
             try:
                 print(f"[DEBUG] Trying PPTX conversion via {method_name}...")
                 method(thumbnail_size, full_dpi, progress_callback)
                 print(f"[DEBUG] PPTX conversion via {method_name} succeeded")
+                _last_ppt_error = None  # Clear error on success
                 return
             except Exception as e:
-                print(f"[DEBUG] {method_name} failed: {e}")
+                error_msg = f"{method_name}: {e}"
+                print(f"[DEBUG] {error_msg}")
+                errors.append(error_msg)
                 continue
 
         # Fallback: create placeholder pages
-        print("[DEBUG] All conversion methods failed, using placeholders")
+        _last_ppt_error = "; ".join(errors)
+        print(f"[DEBUG] All conversion methods failed: {_last_ppt_error}")
         self.pages = []
         for i in range(total):
             if progress_callback:
@@ -592,17 +661,31 @@ class Document:
             raise RuntimeError("PowerPoint COM is only available on Windows")
 
         try:
+            import comtypes
             import comtypes.client
         except ImportError:
             raise RuntimeError("comtypes not installed. Run: pip install comtypes")
+
+        # Diagnose Python/PowerPoint architecture
+        python_bits = 64 if sys.maxsize > 2**32 else 32
+        print(f"[DEBUG] Python architecture: {python_bits}-bit")
 
         presentation = None
         powerpoint = None
         should_close_ppt = True
 
         try:
+            # Initialize COM
+            try:
+                comtypes.CoInitialize()
+            except Exception as e:
+                raise RuntimeError(f"COM initialization failed: {e}")
+
             # Use cached PowerPoint instance
-            powerpoint, should_close_ppt = get_powerpoint_instance()
+            try:
+                powerpoint, should_close_ppt = get_powerpoint_instance()
+            except Exception as e:
+                raise RuntimeError(f"Failed to create PowerPoint instance (Python {python_bits}-bit): {e}")
 
             # Open presentation without window (minimized PowerPoint)
             presentation = powerpoint.Presentations.Open(
