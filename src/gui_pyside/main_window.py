@@ -1528,47 +1528,81 @@ class MainWindow(QMainWindow):
             progress_callback=progress_callback
         )
 
-        # Phase 2: Compute differences for matched pairs
+        # Phase 2: Compute differences for matched pairs (parallelized)
         progress.setLabelText("Computing differences...")
         comparator = ImageComparator(highlight_color=self._highlight_color)
         matched_pairs = self.matching_result.get_matched_pairs()
         total_pairs = len(matched_pairs)
         self.diff_scores = {}  # Clear previous scores
 
-        for i, (left_idx, right_idx, score) in enumerate(matched_pairs):
-            progress.setValue(int((i + 1) / total_pairs * 100) if total_pairs > 0 else 100)
-            progress.setLabelText(f"Computing diff {i + 1}/{total_pairs}...")
-            QApplication.processEvents()
+        # Get all exclusion zones once
+        all_zones = self.exclusion_zones.zones
 
+        # Parallel comparison using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+
+        def compare_pair(pair_data):
+            """Worker function to compare a single pair."""
+            left_idx, right_idx, _ = pair_data
             left_page = self.left_doc.pages[left_idx]
             right_page = self.right_doc.pages[right_idx]
 
-            if left_page.thumbnail and right_page.thumbnail:
-                # Get all exclusion zones (applied to both sides)
-                all_zones = self.exclusion_zones.zones
+            if not (left_page.thumbnail and right_page.thumbnail):
+                return (left_idx, right_idx, None)
 
-                # Compare the images with all exclusion zones
-                diff_result = comparator.compare(
-                    left_page.thumbnail, right_page.thumbnail,
-                    exclusion_zones=all_zones
+            # Use compare_both() - 2x faster than two compare() calls
+            diff_result = comparator.compare_both(
+                left_page.thumbnail, right_page.thumbnail,
+                exclusion_zones=all_zones
+            )
+            return (left_idx, right_idx, diff_result)
+
+        # Use 4-8 workers depending on CPU cores
+        max_workers = min(8, max(4, os.cpu_count() or 4))
+        results = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(compare_pair, pair): pair for pair in matched_pairs}
+
+            for i, future in enumerate(as_completed(futures)):
+                progress.setValue(int((i + 1) / total_pairs * 100) if total_pairs > 0 else 100)
+                progress.setLabelText(f"Computing diff {i + 1}/{total_pairs}...")
+                QApplication.processEvents()
+
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    print(f"Error comparing pair: {e}")
+
+        # Apply results to UI (must be done in main thread)
+        for left_idx, right_idx, diff_result in results:
+            if diff_result is None:
+                continue
+
+            # Store whether there are differences
+            self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
+
+            # Apply highlighted images to thumbnails
+            if diff_result.left_highlight:
+                left_highlight_pixmap = pil_to_qpixmap(diff_result.left_highlight)
+                # Create a compatible DiffResult for the panel
+                from src.core.image_comparator import DiffResult
+                left_diff = DiffResult(
+                    diff_score=diff_result.diff_score,
+                    regions=diff_result.regions,
+                    highlight_image=diff_result.left_highlight
                 )
+                self.left_panel.set_diff_result(left_idx, left_diff, left_highlight_pixmap)
 
-                # Store whether there are differences (for link coloring)
-                self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
-
-                # Apply highlighted images to thumbnails
-                if diff_result.highlight_image:
-                    left_highlight_pixmap = pil_to_qpixmap(diff_result.highlight_image)
-                    self.left_panel.set_diff_result(left_idx, diff_result, left_highlight_pixmap)
-
-                    # Also create highlight for right side
-                    diff_result_right = comparator.compare(
-                        right_page.thumbnail, left_page.thumbnail,
-                        exclusion_zones=all_zones
-                    )
-                    if diff_result_right.highlight_image:
-                        right_highlight_pixmap = pil_to_qpixmap(diff_result_right.highlight_image)
-                        self.right_panel.set_diff_result(right_idx, diff_result_right, right_highlight_pixmap)
+            if diff_result.right_highlight:
+                right_highlight_pixmap = pil_to_qpixmap(diff_result.right_highlight)
+                right_diff = DiffResult(
+                    diff_score=diff_result.diff_score,
+                    regions=diff_result.regions,
+                    highlight_image=diff_result.right_highlight
+                )
+                self.right_panel.set_diff_result(right_idx, right_diff, right_highlight_pixmap)
 
         progress.close()
 
@@ -1717,17 +1751,98 @@ class MainWindow(QMainWindow):
 
     def _export_pdf(self) -> None:
         """Export comparison report to PDF."""
-        QMessageBox.information(
-            self, "Export PDF",
-            "PDF export will be implemented in the full version."
+        if not self.left_doc or not self.right_doc or not self.matching_result:
+            QMessageBox.warning(
+                self, "Warning",
+                "Please load both documents and run comparison before exporting."
+            )
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export PDF Report",
+            "", "PDF Files (*.pdf)"
         )
+        if not path:
+            return
+
+        try:
+            from src.core.export import export_to_pdf, ExportConfig
+
+            config = ExportConfig(
+                include_identical=False,
+                include_thumbnails=True,
+                title=f"Comparison: {self.left_doc.name} vs {self.right_doc.name}"
+            )
+
+            export_to_pdf(
+                self.left_doc,
+                self.right_doc,
+                self.matching_result,
+                self.diff_scores,
+                path,
+                config=config,
+                exclusion_zones=self.exclusion_zones,
+            )
+
+            QMessageBox.information(
+                self, "Export Complete",
+                f"PDF report exported to:\n{path}"
+            )
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Export failed: reportlab is required for PDF export.\nRun: pip install reportlab\n\nError: {e}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Export failed:\n{str(e)}"
+            )
 
     def _export_html(self) -> None:
         """Export comparison report to HTML."""
-        QMessageBox.information(
-            self, "Export HTML",
-            "HTML export will be implemented in the full version."
+        if not self.left_doc or not self.right_doc or not self.matching_result:
+            QMessageBox.warning(
+                self, "Warning",
+                "Please load both documents and run comparison before exporting."
+            )
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export HTML Report",
+            "", "HTML Files (*.html)"
         )
+        if not path:
+            return
+
+        try:
+            from src.core.export import export_to_html, ExportConfig
+
+            config = ExportConfig(
+                include_identical=False,
+                include_thumbnails=True,
+                title=f"Comparison: {self.left_doc.name} vs {self.right_doc.name}"
+            )
+
+            export_to_html(
+                self.left_doc,
+                self.right_doc,
+                self.matching_result,
+                self.diff_scores,
+                path,
+                config=config,
+                exclusion_zones=self.exclusion_zones,
+            )
+
+            QMessageBox.information(
+                self, "Export Complete",
+                f"HTML report exported to:\n{path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Export failed:\n{str(e)}"
+            )
 
     def _show_exclusion_zones_dialog(self) -> None:
         """Show the exclusion zones dialog."""

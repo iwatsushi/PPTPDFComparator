@@ -60,6 +60,27 @@ class DiffResult:
         return len(self.regions)
 
 
+@dataclass
+class DiffResultPair:
+    """Result of comparing two images with highlights for both sides."""
+
+    diff_score: float
+    regions: List[DiffRegion] = field(default_factory=list)
+    diff_image: Optional[Image.Image] = None
+    left_highlight: Optional[Image.Image] = None   # Left image with highlights
+    right_highlight: Optional[Image.Image] = None  # Right image with highlights
+
+    @property
+    def has_differences(self) -> bool:
+        """Check if there are any meaningful differences."""
+        return self.diff_score > 0.01 or len(self.regions) > 0
+
+    @property
+    def diff_count(self) -> int:
+        """Number of difference regions."""
+        return len(self.regions)
+
+
 class ImageComparator:
     """Compares two images and highlights differences."""
 
@@ -236,6 +257,138 @@ class ImageComparator:
             )
 
         return Image.fromarray(result)
+
+    def _create_highlight_image_fast(
+        self,
+        base_image: NDArray,
+        regions: List[DiffRegion]
+    ) -> Image.Image:
+        """Create image with difference regions highlighted (optimized version).
+
+        Uses NumPy vectorized operations for better performance.
+
+        Args:
+            base_image: RGB numpy array
+            regions: List of difference regions
+
+        Returns:
+            PIL Image with highlights
+        """
+        if not regions:
+            return Image.fromarray(base_image)
+
+        # Work with float32 for blending, avoid multiple copies
+        result = base_image.astype(np.float32)
+        highlight_color = np.array(self.highlight_color, dtype=np.float32)
+        alpha = self.highlight_alpha
+
+        for region in regions:
+            x1, y1, x2, y2 = region.bounds
+
+            # Vectorized blending: result = result * (1 - alpha) + color * alpha
+            result[y1:y2, x1:x2] = (
+                result[y1:y2, x1:x2] * (1 - alpha) +
+                highlight_color * alpha
+            )
+
+        # Convert back to uint8
+        result = np.clip(result, 0, 255).astype(np.uint8)
+
+        # Draw borders (minimal loop, only for borders)
+        for region in regions:
+            x1, y1, x2, y2 = region.bounds
+            cv2.rectangle(result, (x1, y1), (x2, y2), self.highlight_color, 2)
+
+        return Image.fromarray(result)
+
+    def compare_both(
+        self,
+        img1: Image.Image,
+        img2: Image.Image,
+        exclusion_zones: Optional[List[ExclusionZone]] = None
+    ) -> DiffResultPair:
+        """Compare two images and create highlights for BOTH sides in one pass.
+
+        This is 2x faster than calling compare() twice because:
+        - Difference calculation is done once
+        - Region detection is done once
+        - Highlights are applied to both images using the same diff mask
+
+        Args:
+            img1: First image (PIL Image) - will be left_highlight
+            img2: Second image (PIL Image) - will be right_highlight
+            exclusion_zones: Areas to ignore during comparison
+
+        Returns:
+            DiffResultPair with highlights for both images
+        """
+        # Ensure same size
+        target_size = (
+            max(img1.width, img2.width),
+            max(img1.height, img2.height)
+        )
+
+        if img1.size != target_size:
+            img1 = img1.resize(target_size, Image.Resampling.LANCZOS)
+        if img2.size != target_size:
+            img2 = img2.resize(target_size, Image.Resampling.LANCZOS)
+
+        # Convert to numpy arrays
+        arr1 = np.array(img1.convert('RGB'))
+        arr2 = np.array(img2.convert('RGB'))
+
+        # Compute absolute difference per channel and take maximum
+        diff_rgb = cv2.absdiff(arr1, arr2)
+        diff = np.max(diff_rgb, axis=2).astype(np.uint8)
+
+        # Apply exclusion mask
+        if exclusion_zones:
+            mask = self._create_exclusion_mask(
+                target_size[0], target_size[1], exclusion_zones
+            )
+            diff = cv2.bitwise_and(diff, diff, mask=cv2.bitwise_not(mask))
+
+        # Threshold to binary
+        _, thresh = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
+
+        # Find contours (difference regions)
+        contours, _ = cv2.findContours(
+            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        # Filter and process regions
+        regions = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area >= self.min_region_area:
+                x, y, w, h = cv2.boundingRect(contour)
+                roi = diff[y:y+h, x:x+w]
+                intensity = float(np.mean(roi)) / 255.0
+                regions.append(DiffRegion(
+                    x=x, y=y, width=w, height=h,
+                    area=int(area), intensity=intensity
+                ))
+
+        # Calculate overall diff score
+        total_pixels = target_size[0] * target_size[1]
+        diff_pixels = np.count_nonzero(thresh)
+        diff_score = diff_pixels / total_pixels if total_pixels > 0 else 0.0
+
+        # Create diff image
+        diff_pil = Image.fromarray(diff)
+
+        # Create highlight images for BOTH sides using the SAME regions
+        # This is the key optimization - we reuse the region detection
+        left_highlight = self._create_highlight_image_fast(arr1, regions)
+        right_highlight = self._create_highlight_image_fast(arr2, regions)
+
+        return DiffResultPair(
+            diff_score=diff_score,
+            regions=regions,
+            diff_image=diff_pil,
+            left_highlight=left_highlight,
+            right_highlight=right_highlight,
+        )
 
     def create_side_by_side(
         self,

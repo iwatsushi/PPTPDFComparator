@@ -1263,49 +1263,84 @@ class MainWindow(wx.Frame):
             progress_callback=progress_callback
         )
 
-        # Phase 2: Compute differences for matched pairs
+        # Phase 2: Compute differences for matched pairs (parallelized)
         progress.Update(0, "Computing differences...")
         comparator = ImageComparator(highlight_color=self._highlight_color)
         matched_pairs = self.matching_result.get_matched_pairs()
         total_pairs = len(matched_pairs)
         self.diff_scores = {}  # Clear previous scores
 
-        for i, (left_idx, right_idx, score) in enumerate(matched_pairs):
-            progress.Update(int((i + 1) / total_pairs * 100) if total_pairs > 0 else 100,
-                          f"Computing diff {i + 1}/{total_pairs}...")
-            wx.GetApp().Yield()
+        # Get all exclusion zones once
+        all_zones = self.exclusion_zones.zones
 
-            # Get images for comparison
+        # Parallel comparison using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+
+        def compare_pair(pair_data):
+            """Worker function to compare a single pair."""
+            left_idx, right_idx, _ = pair_data
             left_page = self.left_doc.pages[left_idx]
             right_page = self.right_doc.pages[right_idx]
 
-            if left_page.thumbnail and right_page.thumbnail:
-                # Get all exclusion zones (applied to both sides)
-                all_zones = self.exclusion_zones.zones
+            if not (left_page.thumbnail and right_page.thumbnail):
+                return (left_idx, right_idx, None)
 
-                # Compare the images with all exclusion zones
-                diff_result = comparator.compare(
-                    left_page.thumbnail, right_page.thumbnail,
-                    exclusion_zones=all_zones
+            # Use compare_both() - 2x faster than two compare() calls
+            diff_result = comparator.compare_both(
+                left_page.thumbnail, right_page.thumbnail,
+                exclusion_zones=all_zones
+            )
+            return (left_idx, right_idx, diff_result)
+
+        # Use 4-8 workers depending on CPU cores
+        max_workers = min(8, max(4, os.cpu_count() or 4))
+        results = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(compare_pair, pair): pair for pair in matched_pairs}
+
+            for i, future in enumerate(as_completed(futures)):
+                progress.Update(int((i + 1) / total_pairs * 100) if total_pairs > 0 else 100,
+                              f"Computing diff {i + 1}/{total_pairs}...")
+                wx.GetApp().Yield()
+
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    print(f"Error comparing pair: {e}")
+
+        # Apply results to UI (must be done in main thread)
+        try:
+            from src.core.image_comparator import DiffResult
+        except ImportError:
+            from core.image_comparator import DiffResult
+
+        for left_idx, right_idx, diff_result in results:
+            if diff_result is None:
+                continue
+
+            # Store whether there are differences
+            self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
+
+            # Apply highlighted images to thumbnails
+            if diff_result.left_highlight:
+                left_highlight_bitmap = pil_to_wxbitmap(diff_result.left_highlight)
+                left_diff = DiffResult(
+                    diff_score=diff_result.diff_score,
+                    regions=diff_result.regions,
+                    highlight_image=diff_result.left_highlight
                 )
+                self.left_panel.set_diff_result(left_idx, left_diff, left_highlight_bitmap)
 
-                # Store whether there are differences (for link coloring)
-                self.diff_scores[(left_idx, right_idx)] = diff_result.has_differences
-
-                # Apply highlighted images to thumbnails
-                if diff_result.highlight_image:
-                    # Convert PIL Image to wx.Bitmap
-                    left_highlight_bitmap = pil_to_wxbitmap(diff_result.highlight_image)
-                    self.left_panel.set_diff_result(left_idx, diff_result, left_highlight_bitmap)
-
-                    # Also create highlight for right side (compare right to left)
-                    diff_result_right = comparator.compare(
-                        right_page.thumbnail, left_page.thumbnail,
-                        exclusion_zones=all_zones
-                    )
-                    if diff_result_right.highlight_image:
-                        right_highlight_bitmap = pil_to_wxbitmap(diff_result_right.highlight_image)
-                        self.right_panel.set_diff_result(right_idx, diff_result_right, right_highlight_bitmap)
+            if diff_result.right_highlight:
+                right_highlight_bitmap = pil_to_wxbitmap(diff_result.right_highlight)
+                right_diff = DiffResult(
+                    diff_score=diff_result.diff_score,
+                    regions=diff_result.regions,
+                    highlight_image=diff_result.right_highlight
+                )
+                self.right_panel.set_diff_result(right_idx, right_diff, right_highlight_bitmap)
 
         progress.Destroy()
 
@@ -1772,19 +1807,111 @@ class MainWindow(wx.Frame):
 
     def _export_pdf(self, event: wx.Event) -> None:
         """Export comparison report to PDF."""
-        wx.MessageBox(
-            "PDF export will be implemented in the full version.",
-            "Export PDF",
-            wx.OK | wx.ICON_INFORMATION
-        )
+        if not self.left_doc or not self.right_doc or not self.matching_result:
+            wx.MessageBox(
+                "Please load both documents and run comparison before exporting.",
+                "Warning",
+                wx.OK | wx.ICON_WARNING
+            )
+            return
+
+        with wx.FileDialog(
+            self,
+            "Export PDF Report",
+            wildcard="PDF Files (*.pdf)|*.pdf",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT
+        ) as dialog:
+            if dialog.ShowModal() == wx.ID_CANCEL:
+                return
+            path = dialog.GetPath()
+
+        try:
+            from src.core.export import export_to_pdf, ExportConfig
+
+            config = ExportConfig(
+                include_identical=False,
+                include_thumbnails=True,
+                title=f"Comparison: {self.left_doc.name} vs {self.right_doc.name}"
+            )
+
+            export_to_pdf(
+                self.left_doc,
+                self.right_doc,
+                self.matching_result,
+                self.diff_scores,
+                path,
+                config=config,
+                exclusion_zones=self.exclusion_zones,
+            )
+
+            wx.MessageBox(
+                f"PDF report exported to:\n{path}",
+                "Export Complete",
+                wx.OK | wx.ICON_INFORMATION
+            )
+        except ImportError as e:
+            wx.MessageBox(
+                f"Export failed: reportlab is required for PDF export.\nRun: pip install reportlab\n\nError: {e}",
+                "Error",
+                wx.OK | wx.ICON_ERROR
+            )
+        except Exception as e:
+            wx.MessageBox(
+                f"Export failed:\n{str(e)}",
+                "Error",
+                wx.OK | wx.ICON_ERROR
+            )
 
     def _export_html(self, event: wx.Event) -> None:
         """Export comparison report to HTML."""
-        wx.MessageBox(
-            "HTML export will be implemented in the full version.",
-            "Export HTML",
-            wx.OK | wx.ICON_INFORMATION
-        )
+        if not self.left_doc or not self.right_doc or not self.matching_result:
+            wx.MessageBox(
+                "Please load both documents and run comparison before exporting.",
+                "Warning",
+                wx.OK | wx.ICON_WARNING
+            )
+            return
+
+        with wx.FileDialog(
+            self,
+            "Export HTML Report",
+            wildcard="HTML Files (*.html)|*.html",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT
+        ) as dialog:
+            if dialog.ShowModal() == wx.ID_CANCEL:
+                return
+            path = dialog.GetPath()
+
+        try:
+            from src.core.export import export_to_html, ExportConfig
+
+            config = ExportConfig(
+                include_identical=False,
+                include_thumbnails=True,
+                title=f"Comparison: {self.left_doc.name} vs {self.right_doc.name}"
+            )
+
+            export_to_html(
+                self.left_doc,
+                self.right_doc,
+                self.matching_result,
+                self.diff_scores,
+                path,
+                config=config,
+                exclusion_zones=self.exclusion_zones,
+            )
+
+            wx.MessageBox(
+                f"HTML report exported to:\n{path}",
+                "Export Complete",
+                wx.OK | wx.ICON_INFORMATION
+            )
+        except Exception as e:
+            wx.MessageBox(
+                f"Export failed:\n{str(e)}",
+                "Error",
+                wx.OK | wx.ICON_ERROR
+            )
 
 
 class MainDropTarget(wx.FileDropTarget):
